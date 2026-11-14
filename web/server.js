@@ -7,6 +7,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { startViewServers } = require('./views');
 
 const ROOT = path.resolve(__dirname, '..');
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -122,6 +123,7 @@ const server = http.createServer((request, response) => {
 
 server.listen(PORT, () => {
   console.log(`BtB 控制台: http://localhost:${PORT}/`);
+  startViewServers();
 });
 
 function shutdown() {

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADNN 三维网络图</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;
+    --panel: rgba(18, 24, 33, 0.92);
+    --line: #263041;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: radial-gradient(circle at 50% 40%, #101a26 0%, #0b0f14 65%);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    overflow: hidden;
+  }
+  #scene { display: block; width: 100vw; height: 100vh; cursor: grab; }
+  #scene.dragging { cursor: grabbing; }
+  header {
+    position: fixed; top: 0; left: 0; right: 0;
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 20px; pointer-events: none;
+    background: linear-gradient(180deg, rgba(11, 15, 20, 0.9), rgba(11, 15, 20, 0));
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: 0.02em; }
+  #stats { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  #hint { margin-left: auto; color: var(--muted); font-size: 12px; }
+  #loading {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    background: rgba(11, 15, 20, 0.86); font-size: 14px; color: var(--text);
+    transition: opacity 0.25s ease;
+  }
+  #loading.hidden { opacity: 0; pointer-events: none; }
+  .spinner {
+    width: 26px; height: 26px; border-radius: 50%;
+    border: 2px solid var(--line); border-top-color: var(--accent);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #detail {
+    position: fixed; right: 18px; bottom: 18px; width: 300px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; font-size: 12px; line-height: 1.7;
+    color: var(--muted); backdrop-filter: blur(8px);
+    max-height: 46vh; overflow: auto;
+  }
+  #detail strong { color: var(--text); font-size: 14px; }
+  #detail code { color: #a5d6ff; }
+  #detail table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  #detail td { padding: 2px 0; }
+  #detail td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  #tooltip {
+    position: fixed; z-index: 5; pointer-events: none;
+    background: rgba(15, 21, 29, 0.96); border: 1px solid var(--line);
+    border-radius: 7px; padding: 7px 10px; font-size: 12px; line-height: 1.6;
+    color: var(--text); white-space: nowrap; display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<header>
+  <h1>ADNN · 三维网络图</h1>
+  <div id="stats"></div>
+  <div id="hint">拖拽旋转 · 滚轮缩放 · 点击节点 · 双击复位</div>
+</header>
+<div id="detail">点击节点查看数值与前向连接</div>
+<div id="tooltip"></div>
+<div id="loading">
+  <div class="spinner"></div>
+  <div id="loading-text">正在读取数据库…</div>
+</div>
+<script src="/graph.js"></script>
+</body>
+</html>

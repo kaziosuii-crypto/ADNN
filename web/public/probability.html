@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADNN 连接概率</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0d1117;
+    --panel: #161b22;
+    --line: #263041;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 32px 48px;
+    background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0; }
+  header span, .sub { color: var(--muted); font-size: 12px; }
+  .cards { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card b { display: block; font-size: 20px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .card span { color: var(--muted); font-size: 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin-bottom: 18px; }
+  .panel h2 { font-size: 14px; margin: 0 0 2px; }
+  .panel p { margin: 0 0 10px; }
+  canvas { display: block; width: 100%; height: 300px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  td { padding: 4px 0; border-bottom: 1px solid var(--line); color: var(--muted); }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+  #empty { color: var(--muted); font-size: 13px; padding: 20px 0; }
+  @media (max-width: 1000px) { .cards { grid-template-columns: repeat(2, 1fr); } body { padding: 18px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>ADNN · 连接传播概率</h1>
+  <span id="meta">正在读取数据库…</span>
+</header>
+<section class="cards" id="cards"></section>
+<section class="panel">
+  <h2>概率分布</h2>
+  <p class="sub">概率 = min(1, 连接权重)，按 10% 分箱统计连接条数</p>
+  <canvas id="histogram"></canvas>
+</section>
+<section class="panel">
+  <h2>每条连接的概率</h2>
+  <p class="sub">按概率降序；纵轴为对数刻度，虚线为 50%</p>
+  <canvas id="strip"></canvas>
+</section>
+<section class="panel">
+  <h2>最强连接</h2>
+  <div id="top"></div>
+</section>
+<div id="empty" hidden>数据库中没有连接。请先在控制台启动网络并等待节点完成激活窗口。</div>
+<script src="/probability.js"></script>
+</body>
+</html>
