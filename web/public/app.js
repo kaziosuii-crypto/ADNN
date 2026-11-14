@@ -16,7 +16,7 @@ const state = {
   others: [],
   regions: {},
   nodeData: new Map(),     // id -> { active, value }
-  edges: [],
+  edgeCount: 0,            // 当前连接总数（增量帧时局部加减）
   outEdges: new Map(),     // id -> [{ dst, w }]
   view: { x: 0, y: 0, scale: 1 },
   hover: null,
@@ -322,21 +322,77 @@ function handleState(message) {
     + (net.save_error ? ` | 保存异常：${net.save_error}` : '');
 }
 
+/** 更新图统计文案，全量与增量帧共用。 */
+function updateGraphStats() {
+  document.getElementById('graph-stats').textContent =
+    `图：${state.nodeData.size} 节点 / ${state.edgeCount} 边`;
+}
+
+/** 收到全量图帧：重建节点表与出边表，并重新统计连接数。 */
 function handleGraph(message) {
   state.nodeData = new Map(message.nodes.map(([id, active, value]) => [id, { active: active === 1, value }]));
-  state.edges = message.edges;
   const outEdges = new Map();
-  for (const [src, dst, w] of state.edges) {
-    if (!outEdges.has(src)) outEdges.set(src, []);
-    outEdges.get(src).push({ dst, w });
+  let count = 0;
+  for (const [src, dst, w] of message.edges) {
+    let list = outEdges.get(src);
+    if (!list) {
+      list = [];
+      outEdges.set(src, list);
+    }
+    list.push({ dst, w });
+    count += 1;
   }
   state.outEdges = outEdges;
+  state.edgeCount = count;
 
-  document.getElementById('graph-stats').textContent =
-    `图：${state.nodeData.size} 节点 / ${state.edges.length} 边`;
-
+  updateGraphStats();
   for (const id of state.nodeData.keys()) positionOf(id);
   if (state.fitPending) fitView();
+  queueRender();
+  updateDetail();
+}
+
+/**
+ * 收到增量图帧：只更新发生变化的节点。
+ * patch.nodes 里出现的每个节点，其出边都以 patch.edges 中的记录为准（可能为空）。
+ */
+function handlePatch(message) {
+  let added = 0;
+  for (const [id, active, value] of message.nodes) {
+    const node = state.nodeData.get(id);
+    if (node) {
+      node.active = active === 1;
+      node.value = value;
+    } else {
+      state.nodeData.set(id, { active: active === 1, value });
+      added += 1;
+    }
+  }
+
+  // 脏节点的旧出边先整体移除，再按增量帧重建，保证删除/新增都被正确反映。
+  const touched = new Set(message.nodes.map(([id]) => id));
+  let count = 0;
+  for (const src of touched) {
+    const old = state.outEdges.get(src);
+    if (old) count -= old.length;
+    state.outEdges.delete(src);
+  }
+  for (const [src, dst, w] of message.edges) {
+    let list = state.outEdges.get(src);
+    if (!list) {
+      list = [];
+      state.outEdges.set(src, list);
+    }
+    list.push({ dst, w });
+    count += 1;
+  }
+  state.edgeCount += count;
+
+  updateGraphStats();
+  if (added) {
+    for (const id of touched) positionOf(id);
+    if (state.fitPending) fitView();
+  }
   queueRender();
   updateDetail();
 }
@@ -355,6 +411,8 @@ function handle(message) {
     handleState(message);
   } else if (message.type === 'graph') {
     handleGraph(message);
+  } else if (message.type === 'patch') {
+    handlePatch(message);
   } else if (message.type === 'stopped') {
     clearInterval(stopTimer);
     stopTimer = null;

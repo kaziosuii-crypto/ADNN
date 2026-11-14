@@ -5,6 +5,7 @@ import os
 import queue
 import random
 import sqlite3
+import sys
 import threading
 import time
 
@@ -19,9 +20,21 @@ CHANNELS = 2
 DECAY_INTERVAL = 1.0
 DECAY_STEP = 0.1
 # worker 每次只处理一小批到期节点就回去读命令，保证激活不会被到期队列堵住。
-WORK_BATCH = 32
-WORK_SPIN = 0.01
+WORK_BATCH = 128
+# worker 空闲时最多睡这么久；有新命令到达会立刻唤醒它，不必靠短超时轮询空转。
+WORK_IDLE_WAIT = 0.25
+# worker 内的事件先攒成一批再跨进程发送，减少管道 put 次数。
+EVENT_BATCH = 64
 WORKER_JOIN_TIMEOUT = 60.0
+
+# 大量排查输出：设置环境变量 BTB_DEBUG=1 即可看到运行期细分日志。
+DEBUG = os.environ.get("BTB_DEBUG") == "1"
+
+
+def _debug(*args):
+    """统一的调试输出入口，默认关闭，避免污染 stdout 的 JSON 数据流。"""
+    if DEBUG:
+        print("[mp_manager]", *args, file=sys.stderr, flush=True)
 # 落盘时每个事务的行数。
 FLUSH_CHUNK = 5000
 # 父进程等待事件消费者追平的时长。
@@ -36,7 +49,6 @@ class NodeView:
         self.timeWindow = window
         self.forwards = {int(key): value for key, value in (forwards or {}).items()}
         self.active = False
-        self._lock = threading.RLock()
 
     def start(self, manager, value):
         manager.activate(self.id, value)
@@ -85,8 +97,23 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
     def snapshot(node):
         return (node.id, float(node.value), node.active, dict(node.forwards))
 
+    # 每条通道一个待发列表；事件按目标节点 ID 取模分到两条通道，保持同一节点的先后顺序。
+    pending = [[], []]
+
     def emit(kind, data):
-        events[int(data[0]) % CHANNELS].put((kind, worker_id, data))
+        channel = int(data[0]) % CHANNELS
+        pending[channel].append((kind, worker_id, data))
+        if len(pending[channel]) >= EVENT_BATCH:
+            events[channel].put(("batch", worker_id, pending[channel]))
+            pending[channel] = []
+
+    def flush_events():
+        """把攒下的事件一次性交给父进程；每批到期节点处理完就调用一次。"""
+        for channel in range(CHANNELS):
+            if not pending[channel]:
+                continue
+            events[channel].put(("batch", worker_id, pending[channel]))
+            pending[channel] = []
 
     def schedule_decay(node):
         # 节点只在第一次产生连接时登记自己的衰减时钟，之后按自身节奏滚动。
@@ -96,33 +123,44 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
         decay_at[node.id] = at
         heapq.heappush(decays, (at, node.id))
 
+    def activate_node(node_id, value):
+        """激活单个节点：S 形累加、登记窗口、上报快照并登记衰减时钟。"""
+        node = get_node(node_id)
+        node.value = 1 / (1 + precision.exp(-(node.value + value)))
+        if not node.active:
+            node.active = True
+            heapq.heappush(deadlines, (time.monotonic() + window, node.id))
+        emit("node", snapshot(node))
+        schedule_decay(node)
+
     def handle(command):
         kind = command[0]
         if kind == "activate":
-            node = get_node(command[1])
-            node.value = 1 / (1 + precision.exp(-(node.value + command[2])))
-            if not node.active:
-                node.active = True
-                heapq.heappush(deadlines, (time.monotonic() + window, node.id))
-            emit("node", snapshot(node))
-            schedule_decay(node)
+            activate_node(command[1], command[2])
+        elif kind == "activate_many":
+            # 同一拍里同属该 worker 的一批激活，逐条走相同的激活路径。
+            for node_id, value in command[1]:
+                activate_node(node_id, value)
         elif kind == "add":
             get_node(command[1], command[2])
         elif kind == "stop":
             return False
         return True
 
+    _debug("worker", worker_id, "启动，节点数", len(nodes))
     try:
         running = True
         while running:
             handled = 0
-            while handled < WORK_BATCH and not stop.is_set():
+            # dopamine / stop 都是跨进程对象，每读一次都要走一次 IPC，按批只读一次。
+            level = float(dopamine.value)
+            stopped_now = stop.is_set()
+            while handled < WORK_BATCH and not stopped_now:
                 now = time.monotonic()
                 if deadlines and deadlines[0][0] <= now:
                     _, node_id = heapq.heappop(deadlines)
                     node = nodes[node_id]
                     target = int(precision.sin(precision.pi * node.value) * 10 ** dps)
-                    level = dopamine.value
                     if level > 0:
                         target += int(random.uniform(-1, 1) * float(precision.sqrt(level)) * 10 ** dps)
                     node.forwards[target] = node.forwards.get(target, 0) + 1
@@ -130,8 +168,6 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
                     state = snapshot(node)
                     emit("node", state)
                     for target_id, connection in state[3].items():
-                        if stop.is_set():
-                            break
                         if random.random() < min(1.0, connection):
                             commands[target_id % count].put(("activate", target_id, state[1]))
                     emit("callback", state)
@@ -155,6 +191,7 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
                         decay_at.pop(node_id, None)
                 else:
                     break
+            flush_events()
             # 每批到期节点之后立刻清一小批命令，任何到期节点都不会独占 worker。
             for _ in range(WORK_BATCH):
                 try:
@@ -164,6 +201,7 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
                 if not handle(command):
                     running = False
                     break
+            flush_events()
             if not running:
                 break
             if stop.is_set():
@@ -183,10 +221,11 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
                 break
             if handled:
                 continue
-            # 空闲时阻塞等命令，超时取最近的节点时钟，避免空转。
+            # 空闲时阻塞等命令：最多睡 WORK_IDLE_WAIT，新命令到达会立刻唤醒；
+            # 若最近有节点时钟到期，则按到期时间提前醒来。
             next_at = min(deadlines[0][0] if deadlines else float("inf"),
                           decays[0][0] if decays else float("inf"))
-            timeout = max(0.0, min(WORK_SPIN, next_at - time.monotonic()))
+            timeout = max(0.0, min(WORK_IDLE_WAIT, next_at - time.monotonic()))
             try:
                 command = commands[worker_id].get(timeout=timeout)
             except queue.Empty:
@@ -194,6 +233,11 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
             if not handle(command):
                 break
     finally:
+        # 退出前把最后一批事件送出去，避免网页丢失收尾状态。
+        try:
+            flush_events()
+        except Exception:
+            pass
         try:
             _save_partition(db_path, nodes, cache_kib, save_lock)
         finally:
@@ -201,15 +245,16 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
             for channel in events:
                 channel.cancel_join_thread()
             commands[worker_id].cancel_join_thread()
+        _debug("worker", worker_id, "退出")
 
 
 def _payload_part(nodes):
+    """把节点及其出边压成网页需要的紧凑数组，不加节点锁以降低序列化开销。"""
     rows, edges = [], []
     for node in nodes:
-        with node._lock:
-            rows.append([node.id, int(node.active), round(float(node.value), 6)])
-            edges.extend([node.id, int(target), round(float(weight), 4)]
-                         for target, weight in node.forwards.items())
+        rows.append([node.id, int(node.active), round(float(node.value), 6)])
+        edges.extend([node.id, int(target), round(float(weight), 4)]
+                     for target, weight in node.forwards.items())
     return rows, edges
 
 
@@ -259,7 +304,13 @@ class MPNodeManager:
         self.save_error = None
         self.cacheNodes = {}
         self.callbacks = {}
+        # 落盘用的脏集合与增量图用的脏集合必须分开：flush() 会清空前者。
         self._dirty = set()
+        self._graph_dirty = set()
+        # O(1) 统计：节点数、激活数、连接数在 _apply/addNode 时增量维护。
+        self._node_count = 0
+        self._active_count = 0
+        self._edge_count = 0
         self._callbacks_pending = []
         self._commands = [self._ctx.Queue() for _ in range(self.worker_count)]
         self._events = tuple(self._ctx.Queue() for _ in range(CHANNELS))
@@ -280,7 +331,11 @@ class MPNodeManager:
             edges = json.loads(forwards or "{}")
             node = NodeView(node_id, value, initdps, initTimeWindow, edges)
             self.cacheNodes[node_id] = node
+            # 启动载入时一次性把计数建好，后续只做增量维护。
+            self._node_count += 1
+            self._edge_count += len(edges)
             partitions[node_id % self.worker_count].append((node_id, value, edges))
+        _debug("载入数据库节点数", self._node_count, "连接数", self._edge_count)
         self._processes = []
         for worker_id in range(self.worker_count):
             process = self._ctx.Process(target=_worker, args=(worker_id, self.worker_count, self._commands, self._events, partitions[worker_id], initdps, initTimeWindow, self._worker_stop, self._dopamine, self.db_path, self.cache_kib, self._save_lock))
@@ -330,9 +385,26 @@ class MPNodeManager:
         return self._stop.is_set()
 
     def activate(self, node_id, value):
+        """激活单个节点，按分片直接投递给对应 worker。"""
         with self._lock:
             if not self.stopped:
                 self._commands[int(node_id) % self.worker_count].put(("activate", int(node_id), float(value)))
+
+    def activate_many(self, pairs):
+        """把同一拍里的激活按 worker 分组，每个 worker 只收一次跨进程消息。
+
+        pairs 是 (node_id, value) 的可迭代对象；同一批里的顺序不影响激活语义。
+        """
+        if self.stopped:
+            return
+        grouped = {}
+        for node_id, value in pairs:
+            node_id = int(node_id)
+            grouped.setdefault(node_id % self.worker_count, []).append((node_id, float(value)))
+        for worker_id, items in grouped.items():
+            self._commands[worker_id].put(("activate_many", items))
+        _debug("activate_many 共", sum(len(items) for items in grouped.values()),
+               "条，分成", len(grouped), "个 worker 批次")
 
     def addNode(self, node_id, value):
         node_id = int(node_id)
@@ -341,8 +413,11 @@ class MPNodeManager:
             if node is None:
                 node = NodeView(node_id, value, self.initdps, self.initTimeWindow)
                 self.cacheNodes[node_id] = node
+                self._node_count += 1
+                self._edge_count += len(node.forwards)
                 with self._dirty_lock:
                     self._dirty.add(node_id)
+                    self._graph_dirty.add(node_id)
                 if not self.stopped:
                     self._commands[node_id % self.worker_count].put(("add", node_id, float(value)))
             return node
@@ -359,22 +434,38 @@ class MPNodeManager:
         self.callbacks[node_id] = fn
 
     def _apply(self, state):
+        """把 worker 上报的节点快照合并进父进程缓存，同时增量维护统计计数。
+
+        两个消费者线程会并发调用，计数和脏集合都在 _dirty_lock 内更新。
+        """
         node_id, value, active, forwards = state
         node = self.cacheNodes.get(node_id)
-        if node is None:
-            with self._lock:
-                node = self.cacheNodes.get(node_id)
-                if node is None:
-                    node = NodeView(node_id, value, self.initdps, self.initTimeWindow)
-                    self.cacheNodes[node_id] = node
-        with node._lock:
-            node.value, node.active, node.forwards = value, active, forwards
         with self._dirty_lock:
+            if node is None:
+                node = NodeView(node_id, value, self.initdps, self.initTimeWindow)
+                self.cacheNodes[node_id] = node
+                self._node_count += 1
+                old_active = False
+                old_edges = 0
+            else:
+                old_active = node.active
+                old_edges = len(node.forwards)
+            if old_active:
+                self._active_count -= 1
+            if active:
+                self._active_count += 1
+            self._edge_count += len(forwards) - old_edges
+            node.value, node.active, node.forwards = value, active, forwards
             self._dirty.add(node_id)
+            self._graph_dirty.add(node_id)
 
     def _handle(self, event):
+        """处理 worker 事件；一个批次里可能包含很多条，递归展开后逐条合并。"""
         kind, worker_id, data = event
-        if kind == "node":
+        if kind == "batch":
+            for item in data:
+                self._handle(item)
+        elif kind == "node":
             self._apply(data)
         elif kind == "callback":
             with self._callback_lock:
@@ -400,20 +491,25 @@ class MPNodeManager:
         return count
 
     def summary(self):
+        """返回统计信息；计数是增量维护的，这里只做 O(1) 读取。"""
         self.pump_events()
-        with self._lock:
-            nodes = list(self.cacheNodes.values())
+        with self._dirty_lock:
+            nodes = self._node_count
+            active = self._active_count
+            edges = self._edge_count
         return {"stopped": self.stopped, "saved": self._closed, "dopamine": self.dopamine,
-                "save_error": self.save_error, "nodes": len(nodes),
-                "active": sum(node.active for node in nodes), "edges": sum(len(node.forwards) for node in nodes)}
+                "save_error": self.save_error, "nodes": nodes,
+                "active": active, "edges": edges}
 
-    def _graph_nodes(self):
-        self.pump_events()
+    def _graph_nodes(self, pump=True):
+        """取当前缓存节点快照；pump=False 时不再等待事件追平（供独立图线程使用）。"""
+        if pump:
+            self.pump_events()
         with self._lock:
             return list(self.cacheNodes.values())
 
-    def graph_payload(self):
-        nodes = self._graph_nodes()
+    def graph_payload(self, pump=True):
+        nodes = self._graph_nodes(pump)
         parts = [None, None]
 
         def build(index, chunk):
@@ -424,11 +520,15 @@ class MPNodeManager:
         for part in parts:
             rows.extend(part[0])
             edges.extend(part[1])
+        # 全量帧已包含所有变化，清空增量集合，避免紧接着再发一遍重复节点。
+        with self._dirty_lock:
+            self._graph_dirty.clear()
         return {"nodes": rows, "edges": edges}
 
-    def graph_json(self):
+    def graph_json(self, pump=True):
         """在 2 个核上并行完成节点/连线的序列化，返回可直接写入网页的 JSON 文本。"""
-        nodes = self._graph_nodes()
+        started = time.monotonic()
+        nodes = self._graph_nodes(pump)
         parts = [None, None]
 
         def build(index, chunk):
@@ -441,7 +541,30 @@ class MPNodeManager:
         _split_build(nodes, build)
         node_text = ",".join(part[0] for part in parts if part[0])
         edge_text = ",".join(part[1] for part in parts if part[1])
+        with self._dirty_lock:
+            self._graph_dirty.clear()
+        _debug("graph_json 全量", len(nodes), "节点，耗时",
+               round((time.monotonic() - started) * 1000, 2), "ms")
         return '{"nodes":[' + node_text + '],"edges":[' + edge_text + ']}'
+
+    def graph_patch_json(self):
+        """只序列化自上一帧以来有变化的节点及其出边；没有变化时返回 None。
+
+        注意：这里清空的是 _graph_dirty，与落盘用的 _dirty 完全独立，
+        因此异步 flush 不会把增量图数据提前清掉。
+        """
+        with self._dirty_lock:
+            dirty, self._graph_dirty = self._graph_dirty, set()
+        if not dirty:
+            return None
+        with self._lock:
+            nodes = [self.cacheNodes[node_id] for node_id in dirty if node_id in self.cacheNodes]
+        started = time.monotonic()
+        rows, edges = _payload_part(nodes)
+        _debug("graph_patch_json 增量", len(rows), "节点，", len(edges), "边，耗时",
+               round((time.monotonic() - started) * 1000, 2), "ms")
+        return ('{"nodes":' + json.dumps(rows, separators=(",", ":"))
+                + ',"edges":' + json.dumps(edges, separators=(",", ":")) + '}')
 
     def flush(self):
         with self._dirty_lock:
@@ -450,10 +573,7 @@ class MPNodeManager:
             return
         with self._lock:
             nodes = [self.cacheNodes[node_id] for node_id in dirty if node_id in self.cacheNodes]
-        rows = []
-        for node in nodes:
-            with node._lock:
-                rows.append((node.id, float(node.value), json.dumps(node.forwards)))
+        rows = [(node.id, float(node.value), json.dumps(node.forwards)) for node in nodes]
         try:
             with self._db_lock:
                 for start in range(0, len(rows), FLUSH_CHUNK):

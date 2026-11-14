@@ -24,6 +24,15 @@ def main():
                 time.sleep(0.02)
             assert callbacks and manager.graph_payload()["edges"]
             assert len({process.pid for process in manager._processes}) == 2
+            # 批量激活后应产生一帧增量图，取走后再取应为空。
+            manager.activate_many([(0, 1), (1, 1)])
+            time.sleep(0.1)
+            manager.pump_events()
+            patch = manager.graph_patch_json()
+            assert patch and '"nodes"' in patch, patch
+            assert manager.graph_patch_json() is None
+            summary = manager.summary()
+            assert summary["nodes"] >= 2 and summary["edges"] >= 2, summary
         finally:
             manager.close()
         database = sqlite3.connect(path)

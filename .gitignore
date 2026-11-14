@@ -17,6 +17,9 @@ connection-probability.html
 node_modules/
 npm-debug.log*
 
+# 内部记忆与工作记录
+.oldmemory/
+
 # 编辑器与系统
 .vscode/
 .idea/

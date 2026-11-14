@@ -98,22 +98,24 @@ class PongRuntime:
     def _on_down(self, node):
         self.game.move_right_down(1)
 
-    def _activate(self, node_id, value):
-        if not self.manager.stopped:
-            self.manager.activate(node_id, value)
-
     def on_tick(self, game):
+        """每个游戏节拍收集一批激活，按 worker 分组后一次性投递。
+
+        视觉网格每帧整片同步激活；感觉节点按实际移动距离在集群内随机挑选。
+        保留每个神经元独立的激活窗口与线程天然时间差，不做统一调度。
+        """
         self.manager.pump_events()
         if self.manager.stopped:
             return
         grid = game.get_grid()
-        for row in range(ROWS):
-            for col in range(COLS):
-                self._activate(row * COLS + col, grid[row][col])
+        # 整帧视觉输入一次性打包，避免 800 次跨进程 put。
+        batch = [((row * COLS + col), grid[row][col])
+                 for row in range(ROWS) for col in range(COLS)]
         for direction, count in (("sense_up", game.paddle_moved_up),
                                  ("sense_down", game.paddle_moved_down)):
             for node_id in random.sample(self.groups[direction], min(count, len(self.groups[direction]))):
-                self._activate(node_id, 1)
+                batch.append((node_id, 1))
+        self.manager.activate_many(batch)
         if game.ball_out:
             self.manager.add_dopamine(1)
             game.ball_out = False
