@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>BtB 神经网络控制台</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">BtB 控制台</div>
+    <div class="stats" id="stats">网络未启动</div>
+    <button id="start">启动网络</button>
+    <button id="stop">强制结束网络并落盘</button>
+  </header>
+
+  <main>
+    <section class="left">
+      <div class="panel">
+        <h2>Pong <span id="grid-size"></span></h2>
+        <canvas id="pong"></canvas>
+        <div class="score" id="score">0 : 0</div>
+      </div>
+      <div class="indicators">
+        <div class="ind" id="ind-up"><span>UP 操作</span><b>0</b></div>
+        <div class="ind" id="ind-down"><span>DOWN 操作</span><b>0</b></div>
+      </div>
+      <div class="legend">
+        绿：激活窗口内　红：未激活　金环：adapter 节点<br>
+        滚轮缩放、拖拽平移；悬停或点击节点查看数值与前向连接。
+      </div>
+    </section>
+
+    <section class="right">
+      <div class="toolbar">
+        <input id="search" placeholder="按 ID 定位节点" inputmode="numeric">
+        <label><input type="checkbox" id="values"> 数值</label>
+        <button id="fit">适应窗口</button>
+        <span class="gstats" id="graph-stats"></span>
+      </div>
+      <div class="graph-wrap">
+        <canvas id="graph"></canvas>
+        <div class="detail" id="detail">悬停或点击节点查看详情</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
