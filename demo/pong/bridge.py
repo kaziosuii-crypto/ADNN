@@ -29,12 +29,19 @@ def emit(payload):
         sys.stdout.flush()
 
 
+def emit_line(line):
+    with _emit_lock:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
 def net_summary(manager):
     return manager.summary()
 
 
-def graph_payload(manager):
-    return manager.graph_payload()
+def graph_line(manager):
+    # graph_json() 已在 2 个核上完成序列化，这里只拼上消息类型，避免父进程再 dumps 一次。
+    return '{"type":"graph",' + manager.graph_json()[1:]
 
 
 def main():
@@ -71,7 +78,7 @@ def main():
         counter += 1
         emit({"type": "state", "game": runtime.game_state, "net": net_summary(runtime.manager)})
         if counter % int(GRAPH_INTERVAL / STATE_INTERVAL) == 0:
-            emit({"type": "graph", **graph_payload(runtime.manager)})
+            emit_line(graph_line(runtime.manager))
 
     runtime.close()
     emit({"type": "stopped", "net": net_summary(runtime.manager)})
