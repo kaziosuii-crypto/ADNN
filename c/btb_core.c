@@ -122,8 +122,8 @@ static double now_sec(void)
 
 static void realtime_after(double seconds, struct timespec *ts)
 {
+    struct timespec base;          /* 两个平台都需要 */
 #ifdef _WIN32
-    struct timespec base;
     timespec_get(&base, TIME_UTC);
 #else
     clock_gettime(CLOCK_REALTIME, &base);
