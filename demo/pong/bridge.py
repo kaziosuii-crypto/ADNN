@@ -15,11 +15,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from demo.pong.pong import COLS, ROWS
 from demo.pong.pong_adapter import PongRuntime
 
-# 图结构更新频率：每秒 2 帧增量。增量帧现在只携带“激活翻转”和“出边增减”的节点，
-# 单帧体积从数 MB 降到几百 KB，2Hz 既够实时，又不会把浏览器主线程压死。
-GRAPH_INTERVAL = 0.5
+# 图结构更新频率：每秒 4 帧采样。原生引擎把“激活翻转/结构变化”攒成分片缓冲，
+# 单帧只有几百 KB，4Hz 足以做到“看起来很实时”，又不会压垮浏览器。
+GRAPH_INTERVAL = 0.25
 # 每积累这么多增量帧就补发一帧全量，防止客户端结构长期偏离。
-FULL_GRAPH_EVERY = 64
+FULL_GRAPH_EVERY = 128
 # 状态帧最小间隔：自适应帧率可能远高于 20fps，这里节流避免淹没 stdout 与浏览器。
 STATE_MIN_INTERVAL = 0.04
 DB_PATH = os.environ.get("BTB_DB", "nodes.db")

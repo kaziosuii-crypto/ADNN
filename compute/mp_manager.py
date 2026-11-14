@@ -472,6 +472,14 @@ class MPNodeManager:
     def register_callback(self, node_id, fn):
         self.callbacks[node_id] = fn
 
+    def used_ids(self):
+        """启动时给分组分配用：返回所有已存在的节点 ID 与出边目标 ID。"""
+        with self._lock:
+            used = set(self.cacheNodes)
+            for node in self.cacheNodes.values():
+                used.update(node.forwards)
+        return used
+
     def _apply_fire(self, node_id, value, active, target, weight):
         """合并 worker 的开火事件（只带新增/加强的那一条边）。
 

@@ -14,6 +14,14 @@ venv/
 network-graph.html
 connection-probability.html
 
+# 原生引擎编译产物（各平台自行编译）
+c/*.dll
+c/*.so
+c/*.dylib
+c/*.lib
+c/*.exp
+c/*.o
+
 # Node
 node_modules/
 npm-debug.log*

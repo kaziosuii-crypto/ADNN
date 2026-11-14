@@ -6,6 +6,7 @@ import time
 
 from demo.pong.pong import COLS, ROWS, TICK_MS, Pong, PongWindow
 from compute.mp_manager import MPNodeManager
+from compute.native_manager import NativeNodeManager, load_native_library
 
 # 视觉神经元数量 = ROWS * COLS = 4000。
 VISUAL_SIZE = ROWS * COLS
@@ -20,11 +21,14 @@ ID_SENSE_DOWN = GROUP_BASE + 3  # 4003
 DPS = 4
 TIME_WINDOW = 2.0  # seconds (2000 ms)
 SAVE_INTERVAL = 2.0  # None: save only when stopping the network
-# 自适应帧率：每 180 秒按“最慢单个神经元耗时”重新适应一次。
-ADAPT_INTERVAL = 180.0
-# 帧长上下限：避免最慢神经元只有几十微秒时把游戏和网页淹没，也避免极慢时画面停滞。
-MIN_FRAME_SECONDS = 0.02  # 最高 50 fps
+# 帧率目标：CPU 没吃满就提高输入帧率，最高 240fps。
+MAX_FPS = 240
+MIN_FRAME_SECONDS = 1.0 / MAX_FPS
 MAX_FRAME_SECONDS = 0.5   # 最低 2 fps
+# 帧率自适应间隔：每 3 秒读一次整机 CPU 占用，比 180 秒更快接近目标帧率。
+FPS_ADAPT_INTERVAL = 3.0
+# 状态帧最小间隔：240fps 下也给网页留出渲染余量（最高 25 状态帧/秒）。
+STATE_MIN_INTERVAL = 0.04
 # 大量排查输出：BTB_DEBUG=1 时在 stderr 打印每拍的耗时与投递量。
 DEBUG = os.environ.get("BTB_DEBUG") == "1"
 
@@ -39,17 +43,58 @@ GROUP_STARTS = {
 }
 
 
+def _cpu_times():
+    """读取 /proc/stat 的第一行，返回 (总时间, 空闲时间)；非 Linux 返回 None。"""
+    try:
+        with open("/proc/stat", "r") as handle:
+            fields = handle.readline().split()
+        values = [int(item) for item in fields[1:]]
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        return sum(values), idle
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _worker_count():
+    """分片/进程数：优先 BTB_WORKERS，否则用整机核数。"""
+    override = os.environ.get("BTB_WORKERS")
+    if override:
+        return max(1, int(override))
+    return max(1, os.cpu_count() or 28)
+
+
+def _create_manager(initvalue, db_path, save_interval):
+    """按 BTB_ENGINE 选择引擎：auto 优先原生 C 引擎，缺失时回退多进程实现。"""
+    mode = os.environ.get("BTB_ENGINE", "auto").strip().lower()
+    if mode in ("auto", "c", "native"):
+        if load_native_library() is not None:
+            try:
+                return NativeNodeManager(0, initvalue, DPS, TIME_WINDOW, db_path, save_interval,
+                                         worker_count=_worker_count(), visual_size=VISUAL_SIZE)
+            except Exception as error:
+                if mode != "auto":
+                    raise
+                _debug("原生引擎初始化失败，回退多进程：", error)
+        elif mode in ("c", "native"):
+            raise RuntimeError("BTB_ENGINE=c，但找不到 c/btb_core 原生库（先编译）")
+    return MPNodeManager(0, initvalue, DPS, TIME_WINDOW, db_path, save_interval)
+
+
 class PongRuntime:
     def __init__(self, db_path="nodes.db", save_interval=SAVE_INTERVAL):
         self.game = Pong()
         grid = self.game.get_grid()
-        self.manager = MPNodeManager(0, grid[0][0], DPS, TIME_WINDOW, db_path, save_interval)
+        self.manager = _create_manager(grid[0][0], db_path, save_interval)
         self._stop_tick = threading.Event()
         self._thread = None
         self._tick_count = 0
-        # 当前帧长（秒）；start() 里每 ADAPT_INTERVAL 秒按最慢神经元耗时更新。
+        # 当前帧长（秒）；start() 每 FPS_ADAPT_INTERVAL 秒按 CPU 占用调整。
         self.interval = TICK_MS / 1000
-        # 每拍结束后的状态回调（bridge 用它把 state 帧直接绑到游戏节拍上，帧率随自适应帧长变化）。
+        # 上一次发出状态帧的时间（240fps 下也不能每拍都建整张网格快照）。
+        self._last_snapshot = 0.0
+        # CPU 采样基线：用于计算整机忙碌比例。
+        self._cpu_prev = None
+        # 每拍结束后的状态回调（bridge 用它把 state 帧直接绑到游戏节拍上）。
         self.on_state = None
         try:
             self.groups = self._load_groups()
@@ -104,9 +149,8 @@ class PongRuntime:
                 if name not in groups or position != len(groups[name]):
                     raise ValueError("Invalid persisted Pong group mapping")
                 groups[name].append(node_id)
-            used = set(manager.cacheNodes) | set(range(GROUP_BASE + 4))
-            for node in manager.cacheNodes.values():
-                used.update(node.forwards)
+            # 已用 ID = 现有节点 + 所有出边目标；引擎无关，由管理器提供。
+            used = manager.used_ids() | set(range(GROUP_BASE + 4))
             for ids in groups.values():
                 used.update(ids)
             candidates = (node_id for node_id in range(GROUP_BASE + 4, 10 ** DPS + 1)
@@ -148,14 +192,32 @@ class PongRuntime:
         if self.manager.stopped:
             return
         grid = game.get_grid()
-        # 整帧视觉输入一次性打包，避免 4000 次跨进程 put。
-        batch = [((row * COLS + col), grid[row][col])
-                 for row in range(ROWS) for col in range(COLS)]
-        for direction, count in (("sense_up", game.paddle_moved_up),
-                                 ("sense_down", game.paddle_moved_down)):
-            for node_id in random.sample(self.groups[direction], min(count, len(self.groups[direction]))):
-                batch.append((node_id, 1))
-        self.manager.activate_many(batch)
+        activate_visual = getattr(self.manager, "activate_visual", None)
+        if callable(activate_visual):
+            # 原生引擎：只把 4000 位的视觉位图交给 C，各分片线程自己展开并计算自己的神经元。
+            bits = bytes(1 if grid[row][col] else 0
+                         for row in range(ROWS) for col in range(COLS))
+            activate_visual(bits)
+            sense = []
+            for direction, count in (("sense_up", game.paddle_moved_up),
+                                     ("sense_down", game.paddle_moved_down)):
+                if count:
+                    for node_id in random.sample(self.groups[direction],
+                                                 min(count, len(self.groups[direction]))):
+                        sense.append((node_id, 1))
+            if sense:
+                self.manager.activate_many(sense)
+            delivered = len(bits)
+        else:
+            # 多进程实现：整帧视觉输入一次性打包，避免 4000 次跨进程 put。
+            batch = [((row * COLS + col), grid[row][col])
+                     for row in range(ROWS) for col in range(COLS)]
+            for direction, count in (("sense_up", game.paddle_moved_up),
+                                     ("sense_down", game.paddle_moved_down)):
+                for node_id in random.sample(self.groups[direction], min(count, len(self.groups[direction]))):
+                    batch.append((node_id, 1))
+            self.manager.activate_many(batch)
+            delivered = len(batch)
         # 新的 dopamine 规则：
         #   右玩家（神经网络控制）失分 -> dopamine +1；
         #   左玩家失分 -> dopamine <= 0 时再 -1，否则直接置 -1。
@@ -176,23 +238,25 @@ class PongRuntime:
         if game.paddle_hit:
             self.manager.dopamine = 0
             game.paddle_hit = False
-        self.game_state = self._game_snapshot()
         self._tick_count += 1
-        if self.on_state is not None:
-            # 状态帧绑定在节拍线程里发出：有几拍就有几帧，不会像独立定时器那样越跑越慢。
+        now = time.monotonic()
+        if self.on_state is not None and now - self._last_snapshot >= STATE_MIN_INTERVAL:
+            # 状态帧绑定在节拍线程里发出，但按最小间隔节流：240fps 下也不会每拍建 4000 格快照。
+            self._last_snapshot = now
+            self.game_state = self._game_snapshot(grid)
             try:
                 self.on_state(self.game_state)
             except Exception as error:
                 # stdout 断开（网页/server 被强制关闭）时不要让节拍线程崩溃。
                 _debug("状态帧发送失败", error)
         if DEBUG and self._tick_count % 40 == 0:
-            _debug("节拍", self._tick_count, "投递", len(batch), "节点，耗时",
+            _debug("节拍", self._tick_count, "投递", delivered, "节点，耗时",
                    round((time.monotonic() - started) * 1000, 2), "ms")
 
-    def _game_snapshot(self):
+    def _game_snapshot(self, grid=None):
         game = self.game
         return {
-            "grid": game.get_grid(), "rows": ROWS, "cols": COLS,
+            "grid": game.get_grid() if grid is None else grid, "rows": ROWS, "cols": COLS,
             "score_left": game.score_left, "score_right": game.score_right,
             "up": game.commanded_up, "down": game.commanded_down,
             "moved_up": game.paddle_moved_up, "moved_down": game.paddle_moved_down,
@@ -203,13 +267,38 @@ class PongRuntime:
         """当前自适应帧率（帧/秒），供 bridge 展示与调试。"""
         return 1.0 / self.interval if self.interval > 0 else 0.0
 
+    def _cpu_busy_ratio(self):
+        """返回自上次采样以来整机 CPU 的忙碌比例（0~1）；拿不到 /proc/stat 时返回 None。"""
+        current = _cpu_times()
+        if current is None:
+            return None
+        previous = self._cpu_prev
+        self._cpu_prev = current
+        if previous is None:
+            return None
+        total = current[0] - previous[0]
+        idle = current[1] - previous[1]
+        if total <= 0:
+            return None
+        return 1.0 - idle / total
+
+    def _adapt_fps(self):
+        """按整机 CPU 占用调节输入帧率：没吃满就加速，接近吃满就降速，上限 240fps。"""
+        busy = self._cpu_busy_ratio()
+        previous_fps = self.fps
+        if busy is not None:
+            if busy < 0.7:
+                self.interval = max(MIN_FRAME_SECONDS, self.interval / 1.3)
+            elif busy > 0.92:
+                self.interval = min(MAX_FRAME_SECONDS, self.interval * 1.3)
+        _debug("帧率自适应：CPU 忙碌", None if busy is None else round(busy, 3),
+               round(previous_fps, 1), "fps ->", round(self.fps, 1), "fps")
+
     def start(self):
         def loop():
-            # 帧长自适应：一帧的现实长度 = 最慢单个神经元计算耗时；
-            # 每 ADAPT_INTERVAL 秒重新采样一次，期间沿用上一轮的帧长。
             interval = self.interval
             next_at = time.monotonic() + interval
-            next_adapt = time.monotonic() + ADAPT_INTERVAL
+            next_adapt = time.monotonic() + FPS_ADAPT_INTERVAL
             while not self._stop_tick.is_set():
                 if self._stop_tick.wait(max(0.0, next_at - time.monotonic())):
                     break
@@ -217,19 +306,20 @@ class PongRuntime:
                     break
                 now = time.monotonic()
                 if now >= next_adapt:
-                    slowest_ms = self.manager.take_slowest_ms()
-                    if slowest_ms > 0:
-                        interval = min(MAX_FRAME_SECONDS, max(MIN_FRAME_SECONDS, slowest_ms / 1000.0))
-                    self.interval = interval
-                    _debug("自适应帧率：最慢神经元", round(slowest_ms, 3), "ms ->",
-                           round(1.0 / interval, 2), "fps")
-                    next_adapt = now + ADAPT_INTERVAL
+                    self._adapt_fps()
+                    interval = self.interval
+                    next_adapt = now + FPS_ADAPT_INTERVAL
                 self.game.update()
+                tick_started = time.monotonic()
                 self.on_tick(self.game)
+                elapsed = time.monotonic() - tick_started
                 next_at += interval
-                # 某一拍明显超时后重新对齐，避免进入追赶式忙循环。
                 now = time.monotonic()
                 if next_at < now:
+                    # 一拍超时：当前帧长喂不动，立刻放宽帧长并把基准对齐到当前时刻，
+                    # 避免进入“追赶式”忙循环把 CPU 全烧在空转上。
+                    interval = min(MAX_FRAME_SECONDS, max(interval * 1.25, elapsed * 1.1))
+                    self.interval = interval
                     next_at = now
         self._thread = threading.Thread(target=loop, name="pong-tick", daemon=True)
         self._thread.start()
