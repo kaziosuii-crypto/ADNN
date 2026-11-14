@@ -31,7 +31,11 @@ const latest = new Map(); // 类型 -> 最近一条原始 JSON 行，供新连�
 let fullGraphLine = null;
 const patchLines = [];
 // 增量帧缓存上限：超过后主动向 Python 要一帧全量，避免缓存无限增长。
-const MAX_PATCHES = 64;
+// 增量帧现在只带激活翻转/出边增减的节点，几十条也远小于一帧全量，24 条足够新连接补齐。
+const MAX_PATCHES = 24;
+// 单个客户端的 socket 积压上限：浏览器处理不过来时直接丢图帧，避免数据在 Node 里无限排队。
+// 不设上限时，慢客户端会积压几十帧几 MB 的数据，表现为“服务器 CPU 不高但页面一直卡”。
+const MAX_CLIENT_BACKLOG = 4 * 1024 * 1024;
 let graphRequested = false;
 let bridge = null;
 let stopping = false;
@@ -49,7 +53,7 @@ function requestFullGraph() {
   graphRequested = true;
   try {
     bridge.stdin.write(`${JSON.stringify({ cmd: 'graph' })}\n`);
-    console.log(`增量帧已达上限 ${MAX_PATCHES}，请求全量图`);
+    console.log('请求全量图（增量缓存达到上限或客户端错过增量帧）');
   } catch (error) {
     graphRequested = false;
     console.error('请求全量图失败:', error.message);
@@ -71,8 +75,34 @@ function broadcastLine(line) {
     latest.set(type, line);
   }
   const frame = `data: ${line}\n\n`;
-  for (const client of clients) client.write(frame);
+  const isGraphFrame = type === 'graph' || type === 'patch';
+  for (const client of clients) {
+    if (client.destroyed || client.writableEnded) {
+      clients.delete(client);
+      continue;
+    }
+    // 浏览器端积压过多时丢弃图帧：宁可让它稍后收一帧全量，也不要在 Node 里无限排队，
+    // 否则页面收到的是几十帧前的旧数据，看起来就是持续卡顿。
+    if (isGraphFrame && client.writableLength > MAX_CLIENT_BACKLOG) {
+      client.needsFullGraph = true;
+      continue;
+    }
+    client.write(frame);
+    if (type === 'graph') client.needsFullGraph = false;
+  }
 }
+
+// 每秒检查一次：有客户端因积压错过了增量帧，就替它要一帧最新全量。
+// 增量帧是可丢的，但全量帧不能丢，否则该客户端的图会永久缺失一部分节点。
+setInterval(() => {
+  if (!bridge) return;
+  for (const client of clients) {
+    if (client.needsFullGraph && client.writableLength < MAX_CLIENT_BACKLOG / 2) {
+      requestFullGraph();
+      break;
+    }
+  }
+}, 1000).unref();
 
 function broadcast(message) {
   broadcastLine(JSON.stringify(message));

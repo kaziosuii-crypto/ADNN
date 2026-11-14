@@ -235,10 +235,13 @@ class PongRuntime:
         self._thread.start()
 
     def close(self):
-        self.manager.request_stop()
+        """结束网络并落盘：先停游戏节拍，再走强制结束路径。"""
+        # 先停节拍线程，保证关闭期间不再向 worker 投递新的激活命令。
         self._stop_tick.set()
         if self._thread:
             self._thread.join()
+        # manager.close() 现在等价于强制路径：递归保存全部节点后立刻终止网络，
+        # 不再等待各 worker 各自收尾落盘，也不给 worker 发 stop 命令。
         self.manager.close()
 
 

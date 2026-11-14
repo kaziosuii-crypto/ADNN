@@ -411,18 +411,54 @@ function queueRender() {
 
 /* ---------- Pong ---------- */
 
+// Pong 像素缓冲：把 40×100 的格子先写进一张原始尺寸的离屏画布，再整体缩放贴到页面画布。
+// 之前每帧调用 4000 次 fillRect，25fps 下就是每秒 10 万次绘制调用，是主线程卡顿的固定开销。
+const pongBuffer = { canvas: null, ctx: null, image: null, pixels: null, rows: 0, cols: 0 };
+// 小端机器上 Uint32 的字节序是 ABGR：#f8fafc -> 0xfffcfaf8，纯黑 -> 0xff000000。
+const PONG_PIXEL_ON = 0xfffcfaf8;
+const PONG_PIXEL_OFF = 0xff000000;
+
+/** 按当前网格尺寸准备像素缓冲（尺寸变化时才重建）。 */
+function ensurePongBuffer() {
+  const rows = state.meta.rows;
+  const cols = state.meta.cols;
+  if (pongBuffer.canvas && pongBuffer.rows === rows && pongBuffer.cols === cols) {
+    return pongBuffer;
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = cols;
+  canvas.height = rows;
+  pongBuffer.canvas = canvas;
+  pongBuffer.ctx = canvas.getContext('2d');
+  pongBuffer.image = pongBuffer.ctx.createImageData(cols, rows);
+  // 复用同一个 32 位视图，避免每帧新建类型化数组。
+  pongBuffer.pixels = new Uint32Array(pongBuffer.image.data.buffer);
+  pongBuffer.rows = rows;
+  pongBuffer.cols = cols;
+  return pongBuffer;
+}
+
+/** 画 Pong 画面：像素级写缓冲 + 一次 drawImage，避免逐格 fillRect 的高频调用。 */
 function drawPong(game) {
   if (!state.meta) return;
-  const cell = pongCanvas.height / state.meta.rows;
-  pongCtx.fillStyle = '#000';
-  pongCtx.fillRect(0, 0, pongCanvas.width, pongCanvas.height);
-  if (!game) return;
-  pongCtx.fillStyle = '#f8fafc';
-  for (let row = 0; row < state.meta.rows; row += 1) {
-    for (let col = 0; col < state.meta.cols; col += 1) {
-      if (game.grid[row][col]) pongCtx.fillRect(col * cell, row * cell, cell, cell);
+  const rows = state.meta.rows;
+  const cols = state.meta.cols;
+  const buffer = ensurePongBuffer();
+  const pixels = buffer.pixels;
+  if (!game) {
+    pixels.fill(PONG_PIXEL_OFF);
+  } else {
+    for (let row = 0; row < rows; row += 1) {
+      const line = game.grid[row];
+      const base = row * cols;
+      for (let col = 0; col < cols; col += 1) {
+        pixels[base + col] = line[col] ? PONG_PIXEL_ON : PONG_PIXEL_OFF;
+      }
     }
   }
+  buffer.ctx.putImageData(buffer.image, 0, 0);
+  pongCtx.imageSmoothingEnabled = false;
+  pongCtx.drawImage(buffer.canvas, 0, 0, pongCanvas.width, pongCanvas.height);
 }
 
 /* ---------- 详情 ---------- */
@@ -535,8 +571,9 @@ function handlePatch(message) {
     else activeIds.delete(id);
   }
 
-  // 脏节点的旧出边先整体移除，再按增量帧重建，保证删除/新增都被正确反映。
-  const touched = new Set(message.nodes.map(([id]) => id));
+  // 只有增量帧里带了边数据的节点才允许覆盖出边表；纯状态变化的节点必须保留旧边，
+  // 否则每次激活翻转都会把该节点的出边从详情面板和统计里清空。
+  const touched = new Set(message.edgeNodes || message.nodes.map(([id]) => id));
   let count = 0;
   for (const src of touched) {
     const old = state.outEdges.get(src);
