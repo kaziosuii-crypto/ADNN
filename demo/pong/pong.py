@@ -2,11 +2,13 @@ import random
 import threading
 import tkinter as tk
 
-CELL_SIZE = 20
-COLS = 50
-ROWS = 16
+# 40 横向 × 100 纵向像素：视觉神经元 = 40*100 = 4000 个。
+CELL_SIZE = 8  # 画面 320×800，避免窗口过高
+COLS = 40
+ROWS = 100
 PADDLE_HEIGHT = 3
-TICK_MS = 200
+# 初始帧长；PongRuntime 会按“最慢单个神经元耗时”每 3 分钟自适应调整。
+TICK_MS = 50
 
 
 class Pong:
@@ -25,6 +27,10 @@ class Pong:
         self.commanded_up = 0
         self.commanded_down = 0
         self.ball_out = False        # 球出画面时置 True，读取后由外部清除
+        # 出界方向：'left' = 球从左边界飞出（左桨漏球，右玩家得分）；
+        #           'right' = 球从右边界飞出（右桨漏球，左玩家得分）。
+        # adapter 用它区分 dopamine 规则，读取后由外部清除。
+        self.out_side = None
         self.paddle_hit = False      # 右桨击中球时置 True，读取后由外部清除
         self.paddle_moved_up = 0
         self.paddle_moved_down = 0
@@ -54,11 +60,15 @@ class Pong:
             self.paddle_hit = True
 
         if self.ball_x < 0:
+            # 球从左边界飞出：左桨漏球，右玩家得分。
             self.score_right += 1
+            self.out_side = "left"
             self.ball_out = True
             self._reset()
         elif self.ball_x >= COLS:
+            # 球从右边界飞出：右桨漏球，左玩家得分。
             self.score_left += 1
+            self.out_side = "right"
             self.ball_out = True
             self._reset()
 

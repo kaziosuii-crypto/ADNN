@@ -15,10 +15,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from demo.pong.pong import COLS, ROWS
 from demo.pong.pong_adapter import PongRuntime
 
-STATE_INTERVAL = 0.2   # 与游戏节拍一致
-GRAPH_INTERVAL = 0.8   # 图结构更新频率
+GRAPH_INTERVAL = 0.25  # 图结构更新频率：每秒 4 帧增量，状态变化更实时
 # 每积累这么多增量帧就补发一帧全量，防止客户端结构长期偏离。
 FULL_GRAPH_EVERY = 64
+# 状态帧最小间隔：自适应帧率可能远高于 20fps，这里节流避免淹没 stdout 与浏览器。
+STATE_MIN_INTERVAL = 0.04
 DB_PATH = os.environ.get("BTB_DB", "nodes.db")
 
 # 大量排查输出：设置 BTB_DEBUG=1 后可在 stderr 看到图线程与命令细节。
@@ -61,7 +62,7 @@ def graph_loop(manager, shutdown, force_full):
     """独立线程负责图结构推送：按固定间隔发全量帧或增量帧。
 
     全量帧在启动时先发一次；之后只发 patch，客户端请求或累计过多增量时再补全量。
-    这样状态推送（5 次/秒）不再被整张图的序列化挡住。
+    这样状态推送（跟随自适应帧率）不再被整张图的序列化挡住。
     """
     next_at = time.monotonic() + GRAPH_INTERVAL
     full = True
@@ -104,6 +105,26 @@ def main():
 
     shutdown = threading.Event()
     force_full = threading.Event()
+    state_frames = 0
+    last_state_at = 0.0
+
+    def emit_state(game_state):
+        """状态帧由节拍线程直接调用：跟随自适应帧率，但按最小间隔节流。"""
+        nonlocal state_frames, last_state_at
+        now = time.monotonic()
+        if now - last_state_at < STATE_MIN_INTERVAL:
+            return
+        last_state_at = now
+        state_frames += 1
+        summary = net_summary(runtime.manager)
+        emit({"type": "state", "game": game_state, "net": summary,
+              "fps": round(runtime.fps, 2)})
+        if DEBUG and state_frames % 20 == 0:
+            _debug("状态帧", state_frames, "帧率", round(runtime.fps, 2),
+                   "节点", summary["nodes"], "激活", summary["active"], "连接", summary["edges"])
+
+    # 把 state 推送绑到游戏节拍上；bridge 主线程只负责命令与收尾。
+    runtime.on_state = emit_state
 
     def read_commands():
         """读取父进程通过 stdin 下发的命令：stop 结束，graph 立即补一帧全量。"""
@@ -131,19 +152,13 @@ def main():
                                     name="bridge-graph", daemon=True)
     graph_thread.start()
 
-    ticks = 0
-    while not shutdown.wait(STATE_INTERVAL):
-        ticks += 1
-        summary = net_summary(runtime.manager)
-        emit({"type": "state", "game": runtime.game_state, "net": summary})
-        if DEBUG and ticks % int(GRAPH_INTERVAL / STATE_INTERVAL) == 0:
-            _debug("状态帧", ticks, "节点", summary)
-
-    # 先停图线程，再让 runtime 收尾落盘，避免图线程继续访问已关闭的缓存。
+    # 主线程不再自己走 50ms 定时器，只等停止命令。
+    shutdown.wait()
     shutdown.set()
     graph_thread.join()
     runtime.close()
     emit({"type": "stopped", "net": net_summary(runtime.manager)})
+    _debug("共发出状态帧", state_frames)
     emit({"type": "closed"})
 
 

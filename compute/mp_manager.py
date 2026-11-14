@@ -37,8 +37,9 @@ def _debug(*args):
         print("[mp_manager]", *args, file=sys.stderr, flush=True)
 # 落盘时每个事务的行数。
 FLUSH_CHUNK = 5000
-# 父进程等待事件消费者追平的时长。
-PUMP_TIMEOUT = 0.1
+# 父进程处理回调时默认不等待事件通道追平：节点算完就继续走，不再固定阻塞游戏线程。
+# 需要同步语义的调用方可以显式传入 timeout。
+PUMP_TIMEOUT = 0.0
 
 
 class NodeView:
@@ -83,6 +84,9 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
     deadlines = []
     decays = []
     decay_at = {}
+    # 自适应帧率采样：记录本批内单个神经元（到期分支）最长的一次计算耗时。
+    slowest_elapsed = 0.0
+    slowest_node_id = -1
     started = time.monotonic()
     for node in nodes.values():
         if node.forwards:
@@ -158,6 +162,8 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
             while handled < WORK_BATCH and not stopped_now:
                 now = time.monotonic()
                 if deadlines and deadlines[0][0] <= now:
+                    # 计时范围覆盖“单神经元从到期待处理到 fan-out 投递完成”的全部现实耗时。
+                    node_started = time.monotonic()
                     _, node_id = heapq.heappop(deadlines)
                     node = nodes[node_id]
                     target = int(precision.sin(precision.pi * node.value) * 10 ** dps)
@@ -173,6 +179,10 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
                     emit("callback", state)
                     schedule_decay(node)
                     handled += 1
+                    elapsed = time.monotonic() - node_started
+                    if elapsed > slowest_elapsed:
+                        slowest_elapsed = elapsed
+                        slowest_node_id = node_id
                 elif decays and decays[0][0] <= now:
                     at, node_id = heapq.heappop(decays)
                     handled += 1
@@ -191,6 +201,11 @@ def _worker(worker_id, count, commands, events, states, dps, window, stop, dopam
                         decay_at.pop(node_id, None)
                 else:
                     break
+            if slowest_elapsed > 0.0:
+                # 上报本批最慢单神经元耗时；data[0] 用 worker_id 以满足 emit 的取模分通道规则。
+                emit("timing", (worker_id, slowest_node_id, slowest_elapsed * 1000.0))
+                slowest_elapsed = 0.0
+                slowest_node_id = -1
             flush_events()
             # 每批到期节点之后立刻清一小批命令，任何到期节点都不会独占 worker。
             for _ in range(WORK_BATCH):
@@ -312,6 +327,10 @@ class MPNodeManager:
         self._active_count = 0
         self._edge_count = 0
         self._callbacks_pending = []
+        # 自适应帧率：记录自上次取值以来最慢的单神经元计算耗时（毫秒）。
+        self._timing_lock = threading.Lock()
+        self._slowest_ms = 0.0
+        self._slowest_id = -1
         self._commands = [self._ctx.Queue() for _ in range(self.worker_count)]
         self._events = tuple(self._ctx.Queue() for _ in range(CHANNELS))
         self._idle = tuple(threading.Event() for _ in range(CHANNELS))
@@ -470,14 +489,40 @@ class MPNodeManager:
         elif kind == "callback":
             with self._callback_lock:
                 self._callbacks_pending.append(data[0])
+        elif kind == "timing":
+            # data = (worker_id, node_id, 毫秒)：只保留采样窗口内最慢的一条。
+            elapsed = float(data[2])
+            with self._timing_lock:
+                if elapsed > self._slowest_ms:
+                    self._slowest_ms = elapsed
+                    self._slowest_id = int(data[1])
 
-    def pump_events(self):
-        """等两条事件通道追平，再把回调交给调用线程执行（回调仍在游戏线程里跑）。"""
+    def take_slowest_ms(self):
+        """取出并清零自上次调用以来观测到的最慢单神经元耗时（毫秒）。
+
+        PongRuntime 每 180 秒调用一次，用这个值重算游戏帧长；返回 0 表示窗口内没有样本。
+        """
+        with self._timing_lock:
+            elapsed = self._slowest_ms
+            node_id = self._slowest_id
+            self._slowest_ms = 0.0
+            self._slowest_id = -1
+        _debug("取最慢神经元", node_id, "耗时", round(elapsed, 3), "ms")
+        return elapsed
+
+    def pump_events(self, timeout=None):
+        """把已到达的事件回调交给调用线程执行，默认零等待（算完就继续走）。
+
+        timeout=None 使用 PUMP_TIMEOUT（当前为 0）；timeout>0 时最多等待事件通道追平，
+        供需要“本帧事件全部落地”的调用方使用。回调仍在调用线程里跑，不跨线程改游戏状态。
+        """
         if self._closed:
             return 0
-        deadline = time.monotonic() + PUMP_TIMEOUT
-        for idle in self._idle:
-            idle.wait(max(0.0, deadline - time.monotonic()))
+        wait = PUMP_TIMEOUT if timeout is None else float(timeout)
+        if wait > 0:
+            deadline = time.monotonic() + wait
+            for idle in self._idle:
+                idle.wait(max(0.0, deadline - time.monotonic()))
         with self._callback_lock:
             pending, self._callbacks_pending = self._callbacks_pending, []
         count = 0
@@ -488,6 +533,7 @@ class MPNodeManager:
                 if node is not None:
                     callback(node)
             count += 1
+        _debug("pump_events 处理回调", count, "个")
         return count
 
     def summary(self):
