@@ -1,6 +1,7 @@
 'use strict';
 
 // 三维网络图：访问页面时从 /api/graph 读取一次数据库，客户端完成布局与渲染。
+// 默认只绘制节点；选中节点后只画它的连接线：红=入边，黄=出边，蓝=双向。
 
 const canvas = document.getElementById('scene');
 const context = canvas.getContext('2d');
@@ -9,6 +10,8 @@ const loadingText = document.getElementById('loading-text');
 const statsEl = document.getElementById('stats');
 const detailEl = document.getElementById('detail');
 const tooltipEl = document.getElementById('tooltip');
+const filterInfoEl = document.getElementById('filter-info');
+const searchInput = document.getElementById('search');
 
 const SPACING = 3.2;
 const REPULSION = 0.9;
@@ -28,6 +31,8 @@ const HALF_OFFSETS = [
 let ids = new Int32Array(0);
 let values = new Float32Array(0);
 let degree = new Int32Array(0);
+let inDeg = new Int32Array(0);
+let outDeg = new Int32Array(0);
 let px = new Float32Array(0);
 let py = new Float32Array(0);
 let pz = new Float32Array(0);
@@ -40,10 +45,14 @@ let fz = new Float32Array(0);
 let edgeS = new Int32Array(0);
 let edgeT = new Int32Array(0);
 let edgeW = new Float32Array(0);
+let reverseEdge = new Int32Array(0);
+let edgeVisible = new Uint8Array(0);
 let edgeCount = 0;
 let adjacency = [];
 let nodeCount = 0;
 let maxDegree = 1;
+let visible = new Uint8Array(0);
+let nodeIndex = new Map();
 
 let sx = new Float32Array(0);
 let sy = new Float32Array(0);
@@ -75,6 +84,13 @@ let lastX = 0;
 let lastY = 0;
 let layoutMs = 0;
 
+let filter = {
+  inMin: -Infinity, inMax: Infinity,
+  outMin: -Infinity, outMax: Infinity,
+  valueMin: -Infinity, valueMax: Infinity,
+  weightMin: -Infinity, weightMax: Infinity,
+};
+
 function clamp(value, low, high) {
   return value < low ? low : value > high ? high : value;
 }
@@ -103,23 +119,26 @@ function prepare(payload) {
 
   ids = new Int32Array(nodeCount);
   values = new Float32Array(nodeCount);
-  const index = new Map();
+  nodeIndex = new Map();
   for (let i = 0; i < nodeCount; i++) {
     ids[i] = nodeRows[i][0];
     const value = Number(nodeRows[i][1]);
     values[i] = Number.isFinite(value) ? clamp(value, 0, 1) : 0;
-    index.set(ids[i], i);
+    nodeIndex.set(ids[i], i);
   }
 
   edgeS = new Int32Array(edgeRows.length);
   edgeT = new Int32Array(edgeRows.length);
   edgeW = new Float32Array(edgeRows.length);
+  reverseEdge = new Int32Array(edgeRows.length);
   adjacency = Array.from({ length: nodeCount }, () => []);
   degree = new Int32Array(nodeCount);
+  inDeg = new Int32Array(nodeCount);
+  outDeg = new Int32Array(nodeCount);
   let count = 0;
   for (const row of edgeRows) {
-    const source = index.get(row[0]);
-    const target = index.get(row[1]);
+    const source = nodeIndex.get(row[0]);
+    const target = nodeIndex.get(row[1]);
     if (source === undefined || target === undefined || source === target) continue;
     edgeS[count] = source;
     edgeT[count] = target;
@@ -128,12 +147,26 @@ function prepare(payload) {
     adjacency[target].push(count);
     degree[source] += 1;
     degree[target] += 1;
+    outDeg[source] += 1;
+    inDeg[target] += 1;
     count += 1;
   }
   edgeCount = count;
   edgeS = edgeS.subarray(0, count);
   edgeT = edgeT.subarray(0, count);
   edgeW = edgeW.subarray(0, count);
+  reverseEdge = reverseEdge.subarray(0, count);
+
+  // 反向边索引：存在 a→b 与 b→a 时，两条边都按“双向”绘制。
+  const pairs = new Map();
+  for (let edge = 0; edge < edgeCount; edge++) {
+    pairs.set(edgeS[edge] * nodeCount + edgeT[edge], edge);
+  }
+  for (let edge = 0; edge < edgeCount; edge++) {
+    const reverse = pairs.get(edgeT[edge] * nodeCount + edgeS[edge]);
+    reverseEdge[edge] = reverse === undefined ? -1 : reverse;
+  }
+
   maxDegree = 1;
   for (let i = 0; i < nodeCount; i++) {
     if (degree[i] > maxDegree) maxDegree = degree[i];
@@ -152,6 +185,8 @@ function prepare(payload) {
   sy = new Float32Array(nodeCount);
   depthZ = new Float32Array(nodeCount);
   persp = new Float32Array(nodeCount);
+  visible = new Uint8Array(nodeCount).fill(1);
+  edgeVisible = new Uint8Array(edgeCount).fill(1);
 
   const random = mulberry32(0x9e3779b9);
   const radius = SPACING * Math.cbrt(Math.max(nodeCount, 1)) * 0.85;
@@ -173,6 +208,7 @@ function rebuildGrid() {
   let maxY = -Infinity;
   let maxZ = -Infinity;
   for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
     if (px[i] < minX) minX = px[i];
     if (py[i] < minY) minY = py[i];
     if (pz[i] < minZ) minZ = pz[i];
@@ -207,6 +243,7 @@ function rebuildGrid() {
   }
 
   for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
     const ix = clamp(Math.floor((px[i] - gridMinX) / gridCell), 0, gridNx - 1);
     const iy = clamp(Math.floor((py[i] - gridMinY) / gridCell), 0, gridNy - 1);
     const iz = clamp(Math.floor((pz[i] - gridMinZ) / gridCell), 0, gridNz - 1);
@@ -222,6 +259,7 @@ function rebuildGrid() {
   gridCursor.set(gridStart.subarray(0, cells));
 
   for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
     const ix = clamp(Math.floor((px[i] - gridMinX) / gridCell), 0, gridNx - 1);
     const iy = clamp(Math.floor((py[i] - gridMinY) / gridCell), 0, gridNy - 1);
     const iz = clamp(Math.floor((pz[i] - gridMinZ) / gridCell), 0, gridNz - 1);
@@ -237,6 +275,7 @@ function simulate() {
 
   const limitSquared = SPACING * SPACING;
   for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
     const ix = clamp(Math.floor((px[i] - gridMinX) / gridCell), 0, gridNx - 1);
     const iy = clamp(Math.floor((py[i] - gridMinY) / gridCell), 0, gridNy - 1);
     const iz = clamp(Math.floor((pz[i] - gridMinZ) / gridCell), 0, gridNz - 1);
@@ -271,8 +310,10 @@ function simulate() {
   }
 
   for (let edge = 0; edge < edgeCount; edge++) {
+    if (!edgeVisible[edge]) continue;
     const a = edgeS[edge];
     const b = edgeT[edge];
+    if (!visible[a] || !visible[b]) continue;
     const ddx = px[b] - px[a];
     const ddy = py[b] - py[a];
     const ddz = pz[b] - pz[a];
@@ -287,6 +328,7 @@ function simulate() {
   }
 
   for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
     fx[i] -= px[i] * GRAVITY;
     fy[i] -= py[i] * GRAVITY;
     fz[i] -= pz[i] * GRAVITY;
@@ -299,40 +341,77 @@ function simulate() {
   }
 }
 
-function finishLayout(elapsed) {
-  layoutMs = elapsed;
+// 筛选后重新给可见节点撒点，避免残留原位置的方块状分布。
+function reseedVisible(count) {
+  const random = mulberry32(0x51ed270b);
+  const radius = SPACING * Math.cbrt(Math.max(count, 1)) * 0.85;
+  for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
+    const theta = random() * Math.PI * 2;
+    const phi = Math.acos(2 * random() - 1);
+    const distance = Math.cbrt(random()) * radius;
+    px[i] = Math.sin(phi) * Math.cos(theta) * distance;
+    py[i] = Math.sin(phi) * Math.sin(theta) * distance;
+    pz[i] = Math.cos(phi) * distance;
+    vx[i] = 0;
+    vy[i] = 0;
+    vz[i] = 0;
+  }
+}
+
+// 只对可见节点做居中与归一化，筛掉节点后仍能铺满画面。
+function normalizeVisible() {
+  let count = 0;
   let centerX = 0;
   let centerY = 0;
   let centerZ = 0;
   for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
     centerX += px[i];
     centerY += py[i];
     centerZ += pz[i];
+    count += 1;
   }
-  centerX /= Math.max(nodeCount, 1);
-  centerY /= Math.max(nodeCount, 1);
-  centerZ /= Math.max(nodeCount, 1);
+  if (count === 0) return;
+  centerX /= count;
+  centerY /= count;
+  centerZ /= count;
 
-  const distances = new Float64Array(nodeCount);
+  const distances = new Float64Array(count);
+  let cursor = 0;
   for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
     const dx = px[i] - centerX;
     const dy = py[i] - centerY;
     const dz = pz[i] - centerZ;
-    distances[i] = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    distances[cursor++] = Math.sqrt(dx * dx + dy * dy + dz * dz);
   }
   distances.sort();
-  const radius = distances[Math.floor(nodeCount * 0.95)] || 1;
+  const radius = distances[Math.floor(count * 0.95)] || 1;
 
   for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
     px[i] = (px[i] - centerX) / radius;
     py[i] = (py[i] - centerY) / radius;
     pz[i] = (pz[i] - centerZ) / radius;
   }
+}
 
+function countVisible() {
+  let count = 0;
+  for (let i = 0; i < nodeCount; i++) {
+    if (visible[i]) count += 1;
+  }
+  return count;
+}
+
+function finishLayout(elapsed) {
+  layoutMs = elapsed;
+  normalizeVisible();
   ready = true;
   zoom = defaultZoom();
   loadingEl.classList.add('hidden');
-  statsEl.textContent = `${nodeCount.toLocaleString()} 节点 · ${edgeCount.toLocaleString()} 连接 · 布局 ${Math.round(layoutMs)} ms · 滚轮缩放查看细节`;
+  updateStats();
   requestRender();
 }
 
@@ -359,6 +438,19 @@ function startLayout() {
     }
   }
   requestAnimationFrame(step);
+}
+
+function updateStats() {
+  const shownNodes = countVisible();
+  let shownEdges = 0;
+  for (let edge = 0; edge < edgeCount; edge++) {
+    if (edgeVisible[edge]) shownEdges += 1;
+  }
+  const prefix = shownNodes === nodeCount ? '' : `显示 ${shownNodes.toLocaleString()} / `;
+  statsEl.textContent = `${prefix}${nodeCount.toLocaleString()} 节点 · ${shownEdges.toLocaleString()} / ${edgeCount.toLocaleString()} 连接 · 布局 ${Math.round(layoutMs)} ms`;
+  if (ready) {
+    filterInfoEl.textContent = `可见 ${shownNodes.toLocaleString()} 节点 · ${shownEdges.toLocaleString()} 条边`;
+  }
 }
 
 function requestRender() {
@@ -404,28 +496,8 @@ function render() {
   }
 
   drawNodes();
-  drawEdges();
+  drawSelectedEdges();
   drawHighlight();
-}
-
-function drawEdges() {
-  if (edgeCount === 0) return;
-  const buckets = [new Path2D(), new Path2D(), new Path2D(), new Path2D(), new Path2D()];
-  for (let edge = 0; edge < edgeCount; edge++) {
-    const a = edgeS[edge];
-    const b = edgeT[edge];
-    const depth = (depthZ[a] + depthZ[b]) * 0.5;
-    const bucket = clamp(Math.floor((depth + 1) * 2.5), 0, 4);
-    const path = buckets[bucket];
-    path.moveTo(sx[a], sy[a]);
-    path.lineTo(sx[b], sy[b]);
-  }
-  const alphas = [0.26, 0.16, 0.1, 0.055, 0.028];
-  context.lineWidth = 0.6;
-  for (let bucket = 0; bucket < buckets.length; bucket++) {
-    context.strokeStyle = `rgba(122, 170, 220, ${alphas[bucket]})`;
-    context.stroke(buckets[bucket]);
-  }
 }
 
 function drawNodes() {
@@ -437,6 +509,7 @@ function drawNodes() {
   const degreeScale = 1 / Math.log1p(maxDegree);
 
   for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
     const weight = Math.log1p(degree[i]) * degreeScale;
     const colorIndex = clamp(Math.floor(weight * colorBuckets), 0, colorBuckets - 1);
     const depthIndex = clamp(Math.floor((depthZ[i] + 1) / 2 * depthBuckets), 0, depthBuckets - 1);
@@ -457,34 +530,55 @@ function drawNodes() {
   }
 }
 
-function drawHighlight() {
-  const index = hovered >= 0 ? hovered : selected;
-  if (index < 0 || index >= nodeCount) return;
+// 只在选中节点时绘制它自己的连接线：红=入边，黄=出边，蓝=双向。
+function drawSelectedEdges() {
+  if (selected < 0 || !visible[selected]) return;
+  const incoming = new Path2D();
+  const outgoing = new Path2D();
+  const both = new Path2D();
 
-  const edges = adjacency[index];
-  if (edges.length) {
-    const path = new Path2D();
-    for (const edge of edges) {
-      const other = edgeS[edge] === index ? edgeT[edge] : edgeS[edge];
-      path.moveTo(sx[index], sy[index]);
-      path.lineTo(sx[other], sy[other]);
-    }
-    context.lineWidth = 1.1;
-    context.strokeStyle = 'rgba(120, 210, 255, 0.85)';
-    context.stroke(path);
+  for (const edge of adjacency[selected]) {
+    if (!edgeVisible[edge]) continue;
+    const other = edgeS[edge] === selected ? edgeT[edge] : edgeS[edge];
+    // 邻居节点即使被节点筛选隐藏，也照常画出连接线，方便确认选中节点的度数。
+    let path = incoming;
+    if (reverseEdge[edge] >= 0) path = both;
+    else if (edgeS[edge] === selected) path = outgoing;
+    path.moveTo(sx[selected], sy[selected]);
+    path.lineTo(sx[other], sy[other]);
   }
 
-  const size = clamp(3.1 * (persp[index] / 0.5), 1.6, 10);
-  context.beginPath();
-  context.arc(sx[index], sy[index], size + 4, 0, Math.PI * 2);
-  context.lineWidth = 1.4;
-  context.strokeStyle = '#f0b429';
-  context.stroke();
+  context.lineWidth = 1.2;
+  context.strokeStyle = 'rgba(248, 81, 73, 0.85)';
+  context.stroke(incoming);
+  context.strokeStyle = 'rgba(227, 179, 65, 0.85)';
+  context.stroke(outgoing);
+  context.lineWidth = 1.8;
+  context.strokeStyle = 'rgba(88, 166, 255, 0.95)';
+  context.stroke(both);
+}
 
-  context.fillStyle = '#e6edf3';
-  context.font = '12px "Segoe UI", "Microsoft YaHei", sans-serif';
-  context.textAlign = 'center';
-  context.fillText(`#${ids[index]}`, sx[index], sy[index] - size - 8);
+function drawHighlight() {
+  if (selected >= 0 && selected < nodeCount && visible[selected]) {
+    const size = clamp(3.1 * (persp[selected] / 0.5), 1.6, 10);
+    context.beginPath();
+    context.arc(sx[selected], sy[selected], size + 4, 0, Math.PI * 2);
+    context.lineWidth = 1.6;
+    context.strokeStyle = '#f0b429';
+    context.stroke();
+    context.fillStyle = '#e6edf3';
+    context.font = '12px "Segoe UI", "Microsoft YaHei", sans-serif';
+    context.textAlign = 'center';
+    context.fillText(`#${ids[selected]}`, sx[selected], sy[selected] - size - 8);
+  }
+  if (hovered >= 0 && hovered < nodeCount && hovered !== selected && visible[hovered]) {
+    const size = clamp(2.6 * (persp[hovered] / 0.5), 1.4, 8);
+    context.beginPath();
+    context.arc(sx[hovered], sy[hovered], size + 3, 0, Math.PI * 2);
+    context.lineWidth = 1.1;
+    context.strokeStyle = 'rgba(230, 237, 243, 0.7)';
+    context.stroke();
+  }
 }
 
 function pick(clientX, clientY) {
@@ -492,6 +586,7 @@ function pick(clientX, clientY) {
   let bestDistance = 18 * 18;
   let bestDepth = Infinity;
   for (let i = 0; i < nodeCount; i++) {
+    if (!visible[i]) continue;
     const dx = sx[i] - clientX;
     const dy = sy[i] - clientY;
     const distanceSquared = dx * dx + dy * dy;
@@ -508,7 +603,7 @@ function showTooltip(index, clientX, clientY) {
   tooltipEl.style.display = 'block';
   tooltipEl.style.left = `${clientX + 14}px`;
   tooltipEl.style.top = `${clientY + 14}px`;
-  tooltipEl.innerHTML = `#${ids[index]} · 数值 ${values[index].toFixed(4)} · 连接 ${adjacency[index].length}`;
+  tooltipEl.textContent = `#${ids[index]} · 数值 ${values[index].toFixed(4)} · 入度 ${inDeg[index]} · 出度 ${outDeg[index]}`;
 }
 
 function hideTooltip() {
@@ -516,19 +611,137 @@ function hideTooltip() {
 }
 
 function showDetail(index) {
-  const rows = adjacency[index]
-    .map((edge) => {
-      const other = edgeS[edge] === index ? edgeT[edge] : edgeS[edge];
-      return [ids[other], edgeW[edge]];
-    })
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8);
+  const incoming = [];
+  const outgoing = [];
+  for (const edge of adjacency[index]) {
+    if (!edgeVisible[edge]) continue;
+    if (edgeS[edge] === index) {
+      const other = edgeT[edge];
+      outgoing.push([ids[other], edgeW[edge], visible[other]]);
+    } else {
+      const other = edgeS[edge];
+      incoming.push([ids[other], edgeW[edge], visible[other]]);
+    }
+  }
+  incoming.sort((a, b) => b[1] - a[1]);
+  outgoing.sort((a, b) => b[1] - a[1]);
+  const incomingHidden = incoming.filter((row) => !row[2]).length;
+  const outgoingHidden = outgoing.filter((row) => !row[2]).length;
 
-  const table = rows.length
-    ? `<table>${rows.map(([target, weight]) => `<tr><td>→ #${target}</td><td>${weight.toFixed(2)}</td></tr>`).join('')}</table>`
-    : '<div style="margin-top:8px">没有前向连接</div>';
+  const rows = (list, color) => list.slice(0, 6)
+    .map(([id, weight, shown]) => `<tr><td><span class="tag" style="background:${showingColor(shown, color)}"></span>#${id}</td><td>${weight.toFixed(2)}</td></tr>`)
+    .join('');
+  const incomingRows = rows(incoming, '#f85149');
+  const outgoingRows = rows(outgoing, '#e3b341');
 
-  detailEl.innerHTML = `<strong>节点 #${ids[index]}</strong><br>数值 <code>${values[index].toFixed(6)}</code> · 连接 ${adjacency[index].length}${table}`;
+  const hiddenHint = (hidden, total) => hidden && hidden === total ? '（邻居均被筛选隐藏，连线仍会画出）' : '';
+
+  detailEl.innerHTML = `
+    <strong>节点 #${ids[index]}</strong><br>
+    数值 <code>${values[index].toFixed(6)}</code> · 入度 ${inDeg[index]} · 出度 ${outDeg[index]}
+    <div class="section">入边（红）${incoming.length} 条</div>
+    ${incomingRows ? `<table>${incomingRows}</table>` : '<div>没有入边</div>'}
+    ${hiddenHint(incomingHidden, incoming.length)}
+    <div class="section">出边（黄）${outgoing.length} 条</div>
+    ${outgoingRows ? `<table>${outgoingRows}</table>` : '<div>没有出边</div>'}
+    ${hiddenHint(outgoingHidden, outgoing.length)}
+  `;
+}
+
+function showingColor(shown, color) {
+  return shown ? color : 'rgba(139, 148, 158, 0.45)';
+}
+
+function readNumber(id, fallback) {
+  const raw = document.getElementById(id).value.trim();
+  if (raw === '') return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function applyFilters() {
+  filter.inMin = readNumber('f-in-min', -Infinity);
+  filter.inMax = readNumber('f-in-max', Infinity);
+  filter.outMin = readNumber('f-out-min', -Infinity);
+  filter.outMax = readNumber('f-out-max', Infinity);
+  filter.valueMin = readNumber('f-value-min', -Infinity);
+  filter.valueMax = readNumber('f-value-max', Infinity);
+  filter.weightMin = readNumber('f-weight-min', -Infinity);
+  filter.weightMax = readNumber('f-weight-max', Infinity);
+
+  let changed = false;
+  let nodesChanged = false;
+  for (let i = 0; i < nodeCount; i++) {
+    const next = inDeg[i] >= filter.inMin && inDeg[i] <= filter.inMax
+      && outDeg[i] >= filter.outMin && outDeg[i] <= filter.outMax
+      && values[i] >= filter.valueMin && values[i] <= filter.valueMax ? 1 : 0;
+    if (visible[i] !== next) {
+      visible[i] = next;
+      changed = true;
+      nodesChanged = true;
+    }
+  }
+  for (let edge = 0; edge < edgeCount; edge++) {
+    const next = edgeW[edge] >= filter.weightMin && edgeW[edge] <= filter.weightMax ? 1 : 0;
+    if (edgeVisible[edge] !== next) {
+      edgeVisible[edge] = next;
+      changed = true;
+    }
+  }
+
+  if (selected >= 0 && !visible[selected]) {
+    selected = -1;
+    detailEl.textContent = '选中节点已被筛选隐藏';
+  } else if (selected >= 0) {
+    showDetail(selected);
+  }
+  hovered = -1;
+  hideTooltip();
+  updateStats();
+
+  if (ready && changed) {
+    const count = countVisible();
+    if (nodesChanged) reseedVisible(count);
+    const iterations = count > 20000 ? 20 : count > 5000 ? 40 : 90;
+    for (let k = 0; k < iterations; k++) simulate();
+    normalizeVisible();
+  }
+  requestRender();
+}
+
+function resetFilters() {
+  for (const id of ['f-in-min', 'f-in-max', 'f-out-min', 'f-out-max', 'f-value-min', 'f-value-max', 'f-weight-min', 'f-weight-max']) {
+    document.getElementById(id).value = '';
+  }
+  applyFilters();
+}
+
+function focusNode(index) {
+  const x = px[index];
+  const y = py[index];
+  const z = pz[index];
+  yaw = Math.atan2(x, z);
+  pitch = clamp(Math.atan2(y, Math.hypot(x, z)), -1.45, 1.45);
+  zoom = Math.max(zoom, defaultZoom());
+}
+
+function locate() {
+  const raw = searchInput.value.trim();
+  if (!raw) return;
+  const index = nodeIndex.get(Number(raw));
+  if (index === undefined) {
+    filterInfoEl.textContent = `未找到节点 #${raw}`;
+    return;
+  }
+  if (!visible[index]) {
+    filterInfoEl.textContent = `节点 #${raw} 被筛选隐藏`;
+    return;
+  }
+  selected = index;
+  focusNode(index);
+  showDetail(index);
+  filterInfoEl.textContent = `已定位到节点 #${raw}`;
+  requestRender();
 }
 
 canvas.addEventListener('pointerdown', (event) => {
@@ -573,7 +786,7 @@ canvas.addEventListener('pointerup', (event) => {
   const index = pick(event.clientX, event.clientY);
   selected = index;
   if (index >= 0) showDetail(index);
-  else detailEl.textContent = '点击节点查看数值与前向连接';
+  else detailEl.textContent = '点击节点查看数值与连接';
   requestRender();
 });
 
@@ -597,6 +810,18 @@ canvas.addEventListener('dblclick', () => {
 });
 
 window.addEventListener('resize', requestRender);
+
+document.getElementById('apply').addEventListener('click', applyFilters);
+document.getElementById('reset').addEventListener('click', resetFilters);
+document.getElementById('locate').addEventListener('click', locate);
+searchInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') locate();
+});
+for (const id of ['f-in-min', 'f-in-max', 'f-out-min', 'f-out-max', 'f-value-min', 'f-value-max', 'f-weight-min', 'f-weight-max']) {
+  document.getElementById(id).addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') applyFilters();
+  });
+}
 
 fetch('/api/graph', { cache: 'no-store' })
   .then((response) => {
