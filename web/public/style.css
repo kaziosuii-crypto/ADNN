@@ -36,7 +36,9 @@ button:hover { background: #273449; }
 
 main {
   display: grid;
-  grid-template-columns: 320px 1fr;
+  /* 拓扑图面板已移除：只保留居中的控制面板，避免 Pong 画布被拉得过大。 */
+  grid-template-columns: minmax(320px, 520px);
+  justify-content: center;
   gap: 14px;
   padding: 14px;
   height: calc(100vh - 53px);

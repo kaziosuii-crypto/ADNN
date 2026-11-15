@@ -8,21 +8,22 @@
 
 ## 功能
 
-- **Pong 演示**：游戏网格的一次采样会激活对应视觉节点，网络的 UP / DOWN / sense 输出反过来驱动球拍。
-- **浏览器控制台**：左侧 Pong 画面与操作指示灯，右侧可缩放、拖拽、搜索的节点网络图。
-- **启停控制**：页面上的“启动网络”“强制结束网络并落盘”按钮；停止时会把节点状态与连接写入 `nodes.db`。
-- **多进程计算**：节点按 ID 分片到多个 worker 进程，跨分片传播通过进程队列完成，主进程统一落盘。
+- **Pong 演示**：游戏网格里点亮的像素会投递给对应视觉神经元，神经元的输出反过来驱动球拍。
+- **浏览器控制台**：Pong 画面、操作指示灯与总体统计（节点数 / 内部节点数 / 帧率）。
+- **启停控制**：页面上的“启动网络”“强制结束网络并落盘”按钮；停止时会把全部神经元的 SMCGP14 图结构写入 `nodes.db` 的 `smcgp_nodes` 表。
+- **SMCGP14 神经元**：每个神经元是一张可自修改的 SMCGP14 计算图（14 种指令），C 实现（`c/smcgp_node.c`）通过 ctypes 与 Python 互操作，缺少库时自动回退纯 Python。
 - **无前端构建步骤**：网页是原生 HTML / CSS / JavaScript，Node 端只使用标准库，无需 `npm install`。
 
 ## 目录结构
 
 ```
 ADNN/
+├─ c/
+│  └─ smcgp_node.c   SMCGP14 神经元的 C 实现（编译成 libsmcgp_node.so）
 ├─ compute/          网络核心
-│  ├─ node.py        单节点：激活窗口、数值计算、向下游传播
-│  ├─ nodeManager.py 单进程版管理器（线程模型）
-│  ├─ mp_manager.py  多进程版管理器（当前控制台使用）
-│  └─ mp_smoke.py    多进程冒烟测试
+│  ├─ node.py        SMCGP14 神经元（纯 Python 参考实现）
+│  ├─ nodeManager.py 神经元群体：调度、路由、落盘（优先调用 C 库）
+│  └─ test_smcgp14.py SMCGP14 边界单测
 ├─ demo/pong/
 │  ├─ pong.py        Pong 规则与网格采样
 │  ├─ pong_adapter.py 网络与游戏的适配层
@@ -86,13 +87,13 @@ python -m venv .venv
 ## 测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m compute.mp_smoke
+.\.venv\Scripts\python.exe -m unittest compute.test_smcgp14
 ```
 
 ## 数据与重置
 
-- 首次运行会自动创建 `nodes.db`，其中保存节点数值与前向连接。
-- 停止网络后数据会落盘；下次启动会从该文件恢复。
+- 首次运行会自动创建 `nodes.db`，其中 `smcgp_nodes` 表保存每个神经元的 SMCGP14 图结构。
+- 停止网络后全部图结构会落盘；下次启动会从该文件恢复。
 - 删除 `nodes.db` 即可从空网络重新开始。
 
 ## 备注

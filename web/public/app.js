@@ -24,8 +24,9 @@ const state = {
   fitPending: true,
 };
 
+// 控制台已不再显示拓扑图：图相关元素可能不存在，这里全部做空值保护。
 const graphCanvas = document.getElementById('graph');
-const graphCtx = graphCanvas.getContext('2d');
+const graphCtx = graphCanvas ? graphCanvas.getContext('2d') : null;
 const pongCanvas = document.getElementById('pong');
 const pongCtx = pongCanvas.getContext('2d');
 // 高频状态帧用到的 DOM 引用只查一次，避免每帧重复查询，减少布局抖动。
@@ -140,6 +141,7 @@ function layoutPongCanvas() {
 }
 
 function resizeGraph() {
+  if (!graphCanvas) return;
   dpr = window.devicePixelRatio || 1;
   width = graphCanvas.clientWidth;
   height = graphCanvas.clientHeight;
@@ -483,6 +485,7 @@ function describe(id) {
 }
 
 function updateDetail() {
+  if (!ui.detail) return;
   const id = state.pinned !== null ? state.pinned : state.hover;
   ui.detail.textContent = id === null ? '悬停或点击节点查看详情' : describe(id);
 }
@@ -509,14 +512,31 @@ function handleState(message) {
 
   ui.stats.textContent =
     `${net.stopped ? (net.saved ? '已停止并落盘' : '正在停止') : '运行中'}`
-    + ` | 节点 ${net.nodes} | 激活 ${net.active} | 连接 ${net.edges}`
-    + ` | dopamine ${net.dopamine.toFixed(3)}`
+    + ` | 节点 ${net.nodes} | 内部节点 ${net.genes}`
+    + ` | 帧率 ${Number.isFinite(message.fps) ? message.fps.toFixed(1) : '-'}`
     + (net.save_error ? ` | 保存异常：${net.save_error}` : '');
 }
 
 /** 更新图统计文案，全量与增量帧共用。 */
 function updateGraphStats() {
+  if (!ui.graphStats) return;
   ui.graphStats.textContent = `图：${state.nodeData.size} 节点 / ${state.edgeCount} 边`;
+}
+
+/**
+ * 兼容两种边数据格式：
+ *   - 旧多进程实现：[[src, dst, w], ...]；
+ *   - 原生引擎：扁平数组 [src, dst, w, src, dst, w, ...]（更省体积与解析时间）。
+ */
+function forEachEdge(edges, fn) {
+  if (!edges || !edges.length) return;
+  if (Array.isArray(edges[0])) {
+    for (const [src, dst, w] of edges) fn(src, dst, w);
+    return;
+  }
+  for (let i = 0; i + 2 < edges.length; i += 3) {
+    fn(edges[i], edges[i + 1], edges[i + 2]);
+  }
 }
 
 /** 收到全量图帧：重建节点表与出边表，并重新统计连接数。 */
@@ -528,7 +548,7 @@ function handleGraph(message) {
   }
   const outEdges = new Map();
   let count = 0;
-  for (const [src, dst, w] of message.edges) {
+  forEachEdge(message.edges, (src, dst, w) => {
     let list = outEdges.get(src);
     if (!list) {
       list = [];
@@ -536,7 +556,7 @@ function handleGraph(message) {
     }
     list.push({ dst, w });
     count += 1;
-  }
+  });
   state.outEdges = outEdges;
   state.edgeCount = count;
   graphVersion += 1;
@@ -580,7 +600,7 @@ function handlePatch(message) {
     if (old) count -= old.length;
     state.outEdges.delete(src);
   }
-  for (const [src, dst, w] of message.edges) {
+  forEachEdge(message.edges, (src, dst, w) => {
     let list = state.outEdges.get(src);
     if (!list) {
       list = [];
@@ -588,7 +608,7 @@ function handlePatch(message) {
     }
     list.push({ dst, w });
     count += 1;
-  }
+  });
   state.edgeCount += count;
   graphVersion += 1;
 
@@ -680,19 +700,27 @@ stopButton.addEventListener('click', async () => {
   }
 });
 
-document.getElementById('fit').addEventListener('click', fitView);
-document.getElementById('values').addEventListener('change', queueRender);
+// 工具栏属于拓扑图面板，已随面板一起移除，这里做存在性保护。
+const fitButton = document.getElementById('fit');
+if (fitButton) fitButton.addEventListener('click', fitView);
+const valuesToggle = document.getElementById('values');
+if (valuesToggle) valuesToggle.addEventListener('change', queueRender);
 
-document.getElementById('search').addEventListener('keydown', (event) => {
-  if (event.key !== 'Enter') return;
-  const id = Number(event.target.value.trim());
-  if (!Number.isFinite(id) || !state.meta) return;
-  state.pinned = id;
-  state.view.scale = Math.max(state.view.scale, 1.2);
-  centerOn(id);
-  updateDetail();
-});
+const searchInput = document.getElementById('search');
+if (searchInput) {
+  searchInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    const id = Number(event.target.value.trim());
+    if (!Number.isFinite(id) || !state.meta) return;
+    state.pinned = id;
+    state.view.scale = Math.max(state.view.scale, 1.2);
+    centerOn(id);
+    updateDetail();
+  });
+}
 
+// 拓扑图面板已从控制台移除：所有图交互只在 canvas 存在时绑定。
+if (graphCanvas) {
 let dragging = false;
 let dragStart = null;
 graphCanvas.addEventListener('mousedown', (event) => {
@@ -812,6 +840,7 @@ graphCanvas.addEventListener('click', (event) => {
 });
 
 new ResizeObserver(resizeGraph).observe(graphCanvas);
+}
 const source = new EventSource('/events');
 source.onmessage = (event) => handle(JSON.parse(event.data));
 resizeGraph();

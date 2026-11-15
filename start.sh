@@ -48,10 +48,10 @@ fi
 echo "[2/4] 安装 Python 依赖..."
 "$VENV_PY" -m pip install --disable-pip-version-check -q -r requirements.txt
 
-# 编译原生 C 引擎：有编译器就编译，没有就回退多进程实现（BTB_ENGINE=auto 会自动选择）。
-echo "[3/4] 编译原生神经元引擎..."
-C_SRC="c/btb_core.c"
-C_LIB="c/libbtb_core.so"
+# 编译 SMCGP14 的 C 实现：有编译器就编译，没有就回退纯 Python 的 Node 实现。
+echo "[3/4] 编译 SMCGP14 神经元引擎..."
+C_SRC="c/smcgp_node.c"
+C_LIB="c/libsmcgp_node.so"
 CC_BIN=""
 for candidate in clang gcc cc; do
   if command -v "$candidate" >/dev/null 2>&1; then
@@ -60,18 +60,18 @@ for candidate in clang gcc cc; do
   fi
 done
 if [ ! -f "$C_SRC" ]; then
-  echo "  [警告] 缺少 $C_SRC，将回退多进程实现。"
+  echo "  [警告] 缺少 $C_SRC，将回退纯 Python 实现。"
 elif [ -z "$CC_BIN" ]; then
-  echo "  [警告] 未找到 C 编译器（clang/gcc/cc），将回退多进程实现。"
+  echo "  [警告] 未找到 C 编译器（clang/gcc/cc），将回退纯 Python 实现。"
 elif [ -f "$C_LIB" ] && [ "$C_LIB" -nt "$C_SRC" ]; then
   echo "  $C_LIB 已是最新，跳过编译。"
 else
   if "$CC_BIN" -O3 -fPIC -shared -pthread -o "$C_LIB" "$C_SRC"; then
     echo "  已用 $CC_BIN 编译 $C_LIB"
   else
-    # 编译失败不阻断启动：删掉半成品，运行期 auto 会自动回退多进程实现。
+    # 编译失败不阻断启动：删掉半成品，nodeManager 会自动回退纯 Python 实现。
     rm -f "$C_LIB"
-    echo "  [警告] 编译失败，将回退多进程实现。"
+    echo "  [警告] 编译失败，将回退纯 Python 实现。"
   fi
 fi
 

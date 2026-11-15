@@ -34,6 +34,10 @@ class Pong:
         self.paddle_hit = False      # 右桨击中球时置 True，读取后由外部清除
         self.paddle_moved_up = 0
         self.paddle_moved_down = 0
+        # 视觉输入位图（ROWS*COLS 字节，0/1）：每拍只按增量刷新，供 C 引擎直接投喂，
+        # 避免每拍在 Python 里重新构造 4000 个元素。
+        self._cells = bytearray(ROWS * COLS)
+        self._refresh_cells()
 
     def move_right_up(self, val):
         if val == 1:
@@ -52,10 +56,14 @@ class Pong:
         if self.ball_y <= 0 or self.ball_y >= ROWS - 1:
             self.dy = -self.dy
 
-        if self.ball_x <= 1 and self.left_paddle_y <= self.ball_y < self.left_paddle_y + PADDLE_HEIGHT:
+        # 只有球“正朝桨飞”时才反弹：否则球停在 x=0/1 会被两侧判定反复翻转 dx，
+        # 卡在边缘来回一次、永远打不出去（表现为比分与 dopamine 长时间不变化）。
+        if (self.dx < 0 and self.ball_x <= 1
+                and self.left_paddle_y <= self.ball_y < self.left_paddle_y + PADDLE_HEIGHT):
             self.dx = -self.dx
 
-        if self.ball_x >= COLS - 2 and self.right_paddle_y <= self.ball_y < self.right_paddle_y + PADDLE_HEIGHT:
+        if (self.dx > 0 and self.ball_x >= COLS - 2
+                and self.right_paddle_y <= self.ball_y < self.right_paddle_y + PADDLE_HEIGHT):
             self.dx = -self.dx
             self.paddle_hit = True
 
@@ -74,6 +82,8 @@ class Pong:
 
         self._move_left_ai()
         self._apply_right_command()
+        # 每拍结束刷新一次位图（4000 字节清零 + 几个点写入，成本固定且很小）。
+        self._refresh_cells()
 
     def _reset(self):
         self.ball_x = COLS // 2
@@ -99,16 +109,25 @@ class Pong:
         self.paddle_moved_up = max(0, before - self.right_paddle_y)
         self.paddle_moved_down = max(0, self.right_paddle_y - before)
 
-    def get_grid(self):
-        grid = [[0] * COLS for _ in range(ROWS)]
+    def _refresh_cells(self):
+        """把桨和球写进位图；位图直接作为视觉神经元的输入。"""
+        cells = self._cells
+        cells[:] = bytes(ROWS * COLS)
         for i in range(PADDLE_HEIGHT):
             if 0 <= self.left_paddle_y + i < ROWS:
-                grid[self.left_paddle_y + i][0] = 1
+                cells[(self.left_paddle_y + i) * COLS] = 1
             if 0 <= self.right_paddle_y + i < ROWS:
-                grid[self.right_paddle_y + i][COLS - 1] = 1
+                cells[(self.right_paddle_y + i) * COLS + COLS - 1] = 1
         if 0 <= self.ball_y < ROWS and 0 <= self.ball_x < COLS:
-            grid[self.ball_y][self.ball_x] = 1
-        return grid
+            cells[self.ball_y * COLS + self.ball_x] = 1
+
+    def get_bits(self):
+        """返回可直接传给 C 引擎的视觉位图（每拍已刷新，调用方不要原地修改）。"""
+        return self._cells
+
+    def get_grid(self):
+        cells = self._cells
+        return [list(cells[row * COLS:(row + 1) * COLS]) for row in range(ROWS)]
 
 
 class PongWindow:
