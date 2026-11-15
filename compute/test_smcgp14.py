@@ -9,11 +9,12 @@
 - 群体层的外层寻址、消息汇总与落盘重载。
 """
 
+import math
 import os
 import tempfile
 import unittest
 
-from compute.node import MAX_ADD_GENES, Gene, Node, Op, distribute_inputs
+from compute.node import Gene, Node, Op, add_gene_count, distribute_inputs
 from compute.nodeManager import load_smcgp_library, nodemgr
 
 
@@ -98,16 +99,35 @@ class NodeSelfModifyTest(unittest.TestCase):
         node.run([] if inputs is None else inputs)
         return node
 
-    def test_add_inserts_random_genes(self):
-        node = self._run_trigger([g(Op.CONST), g(Op.ADD, p0=0, p1=2),
+    def test_add_inserts_genes(self):
+        # 触发值 a=0 -> 16·sin(0)=0 -> 数量夹到最小 1。
+        node = self._run_trigger([g(Op.CONST), g(Op.ADD, p0=0),
                                   g(Op.OUTPUT, c0=1, c1=1)])
-        self.assertEqual(len(node.graph), 5)
+        self.assertEqual(len(node.graph), 4)
         self.assertEqual(node.modification_log[0]["op"], "ADD")
 
-    def test_add_count_is_capped(self):
-        node = self._run_trigger([g(Op.CONST), g(Op.ADD, p0=0, p1=999),
-                                  g(Op.OUTPUT, c0=1, c1=1)])
-        self.assertEqual(len(node.graph), 3 + MAX_ADD_GENES)
+    def test_add_count_follows_sine_of_trigger(self):
+        """ADD 数量 = clamp(round(|16·sin(a)|), 1, 16)，a 是触发值，不再由 p1 决定。"""
+        def inserted(value):
+            node = self._run_trigger([g(Op.CONST, p0=value), g(Op.ADD, p0=0),
+                                      g(Op.OUTPUT, c0=1, c1=1)])
+            return len(node.graph) - 3
+        self.assertEqual(inserted(0.0), 1)             # 16·sin(0)=0 -> 夹到 1
+        self.assertEqual(inserted(math.pi / 6), 8)     # 16·0.5=8
+        self.assertEqual(inserted(math.pi / 2), 16)    # 16·1=16
+        self.assertEqual(inserted(-math.pi / 2), 16)   # 取绝对值
+        self.assertEqual(inserted(10.0), add_gene_count(10.0))
+
+    def test_add_stops_at_max_genes(self):
+        """单神经元基因上限：ADD 最多长到上限，超出部分丢弃；之后不再增长。"""
+        graph = [g(Op.CONST) for _ in range(19)] + [g(Op.CONST, p0=math.pi / 2),
+                                                    g(Op.ADD, p0=0),
+                                                    g(Op.OUTPUT, c0=1, c1=1)]
+        node = Node(1, graph, seed=7, max_genes=25)
+        node.run([])
+        self.assertEqual(len(node.graph), 25)
+        node.run([])
+        self.assertEqual(len(node.graph), 25)
 
     def test_del_slice_is_half_open(self):
         node = self._run_trigger([g(Op.CONST), g(Op.CONST, p0=1),
@@ -182,8 +202,27 @@ class GroupTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mgr = nodemgr(dps=4, seed=1, db_path=os.path.join(tmp, "t.db"), save_interval=None)
             try:
-                self.assertEqual(mgr.route_id(-12.7), 12)
-                self.assertEqual(mgr.route_id(10005.9), 5)
+                # 目标编码乘 10^dps 后取模：-12.7 -> 7000，10005.9 -> 9000。
+                self.assertEqual(mgr.route_id(-12.7), 7000)
+                self.assertEqual(mgr.route_id(10005.9), 9000)
+            finally:
+                mgr.close()
+
+    def test_blocked_range_rejects_routed_input(self):
+        """拒收区间内的节点（刺激神经元）不能被别的神经元路由写入，但仍可显式激活。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = nodemgr(dps=5, seed=1, db_path=os.path.join(tmp, "t.db"),
+                          save_interval=None, blocked_range=(10000, 10000))
+            try:
+                simple = [g(Op.INP), g(Op.OUTPUT, c0=1, c1=1)]
+                mgr.addNode(5, simple)
+                mgr.addNode(6, simple)
+                # dps=5：0.15 -> 15000（刺激区间，应被丢弃），0.5 -> 50000（正常写入）。
+                deliveries = mgr.run_round({5: [0.15], 6: [0.5]})
+                self.assertNotIn(15000, deliveries)
+                self.assertIn(50000, deliveries)
+                # 显式激活刺激神经元仍然有效。
+                self.assertEqual(mgr.activate(15000, 1.0), 1)
             finally:
                 mgr.close()
 
@@ -195,21 +234,65 @@ class GroupTest(unittest.TestCase):
             simple = [g(Op.INP), g(Op.OUTPUT, c0=1, c1=1)]
             mgr.addNode(5, simple)
             mgr.addNode(6, simple)
-            deliveries = mgr.run_round({5: [0.5], 6: [0.7]})
-            # 两条消息都路由到神经元 0，按消息汇总。
-            self.assertEqual(deliveries, {0: [0.5, 0.7]})
-            for node_id in (0, 5, 6):
+            # 0.5 -> 5000，0.50003 -> 5000：两条消息汇总到同一个目标神经元。
+            deliveries = mgr.run_round({5: [0.5], 6: [0.50003]})
+            self.assertIn(5000, deliveries)
+            self.assertEqual(len(deliveries[5000]), 2)
+            for node_id in (5, 6, 5000):
                 mgr.saveNodeToDatabase(node_id)
-            mgr.flush()
+            mgr.flush(all_nodes=True)
             mgr.close()
 
             again = nodemgr(dps=4, seed=1, db_path=path, save_interval=None)
             try:
-                self.assertIsNotNone(again.getNodeFromCache(0))
                 self.assertIsNotNone(again.getNodeFromCache(5))
                 self.assertIsNotNone(again.getNodeFromCache(6))
+                self.assertIsNotNone(again.getNodeFromCache(5000))
             finally:
                 again.close()
+
+
+    def test_global_gene_limit_blocks_add(self):
+        """全局基因总数上限（默认 800 万，这里用 25 测边界）：ADD 不能把总基因数顶破。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = nodemgr(dps=4, seed=1, db_path=os.path.join(tmp, "t.db"),
+                          save_interval=None, max_total_genes=25)
+            try:
+                graph = ([g(Op.CONST) for _ in range(19)]
+                         + [g(Op.CONST, p0=math.pi / 2), g(Op.ADD, p0=0),
+                            g(Op.OUTPUT, c0=1, c1=1)])
+                mgr.addNode(9, graph)
+                for _ in range(3):
+                    mgr.activate(9, 0.0)
+                    mgr.pump_events()
+                    genes = (len(mgr._get_genome_native(9)) if mgr.native
+                             else len(mgr.getNodeFromCache(9).graph))
+                    # 22 个基因 + 全局剩余 3 = 25；后续轮的 ADD 全部被上限拦下。
+                    self.assertEqual(genes, 25)
+            finally:
+                mgr.close()
+
+
+
+    def test_activity_statistics_only_count_expanded(self):
+        """控制台统计：保留区间内的节点不算扩展神经元（执行/待执行各一套计数）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = nodemgr(dps=5, seed=1, db_path=os.path.join(tmp, "t.db"),
+                          save_interval=None, reserved_ranges=[(0, 20000)])
+            try:
+                graph = [g(Op.CONST, p0=2.5), g(Op.OUTPUT, c0=1, c1=1)]
+                mgr.addNode(9, graph)
+                mgr.activate(9, 0.5)
+                mgr.pump_events()
+                summary = mgr.summary()
+                # 节点 9 在保留区间内：执行总数 1，扩展 0。
+                self.assertEqual(summary["run_total"], 1)
+                self.assertEqual(summary["run_expanded"], 0)
+                # 目标编码 2.5 -> 2.5*10^5 % 10^5 = 50000，属于扩展神经元。
+                self.assertEqual(summary["pending_total"], 1)
+                self.assertEqual(summary["pending_expanded"], 1)
+            finally:
+                mgr.close()
 
 
 class NativeParityTest(unittest.TestCase):
@@ -219,10 +302,10 @@ class NativeParityTest(unittest.TestCase):
         if load_smcgp_library() is None:
             self.skipTest("未编译 c/libsmcgp_node.so（C 版不可用）")
 
-    def _run_native(self, graph, inputs):
+    def _run_native(self, graph, inputs, dps=4):
         """在原生模式的群体里跑一轮，返回消息汇总与回写后的图。"""
         with tempfile.TemporaryDirectory() as tmp:
-            mgr = nodemgr(dps=4, seed=1, db_path=os.path.join(tmp, "t.db"), save_interval=None)
+            mgr = nodemgr(dps=dps, seed=1, db_path=os.path.join(tmp, "t.db"), save_interval=None)
             try:
                 self.assertTrue(mgr.native)
                 mgr.addNode(9, graph, seed=1)
@@ -238,7 +321,8 @@ class NativeParityTest(unittest.TestCase):
         deliveries, native_graph = self._run_native(graph, [0.5])
         self.assertEqual([(item.value, item.destination) for item in python_emissions],
                          [(5.0, 5.0)])
-        self.assertEqual(deliveries, {5: [5.0]})
+        # 目标编码 5.0 -> 5.0*10^4 % 10^4 = 0。
+        self.assertEqual(deliveries, {0: [5.0]})
         self.assertEqual([(gene.op, gene.c0, gene.c1) for gene in native_graph],
                          [(gene.op, gene.c0, gene.c1) for gene in graph])
 
@@ -251,6 +335,43 @@ class NativeParityTest(unittest.TestCase):
         self.assertEqual(len(native_graph), len(python_node.graph))
         self.assertEqual([gene.op for gene in native_graph],
                          [gene.op for gene in python_node.graph])
+
+    def test_parity_on_add_count(self):
+        """触发值 a=π/2 时两版都插入 16 个节点（16·sin(π/2)）。"""
+        graph = [g(Op.CONST, p0=math.pi / 2), g(Op.ADD, p0=0),
+                 g(Op.OUTPUT, c0=1, c1=1)]
+        python_node = Node(9, graph, seed=1)
+        python_node.run([0.0])
+        _, native_graph = self._run_native(graph, [0.0])
+        self.assertEqual(len(python_node.graph), 19)
+        self.assertEqual(len(native_graph), 19)
+
+    def test_native_add_stops_at_max_genes(self):
+        """C 引擎的 ADD 数量映射与基因上限都与 Python 版一致（dps=1 -> 2.5 × 10 = 25）。"""
+        graph = [g(Op.CONST) for _ in range(19)] + [g(Op.CONST, p0=math.pi / 2),
+                                                    g(Op.ADD, p0=0),
+                                                    g(Op.OUTPUT, c0=1, c1=1)]
+        python_node = Node(9, graph, seed=1, max_genes=25)
+        python_node.run([0.0])
+        _, native_graph = self._run_native(graph, [0.0], dps=1)
+        self.assertEqual(len(python_node.graph), 25)
+        self.assertEqual(len(native_graph), 25)
+
+
+    def test_rounds_keep_running(self):
+        """连续多轮都必须真的执行到节点（防止待执行标记泄漏导致网络静默）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = nodemgr(dps=4, seed=1, db_path=os.path.join(tmp, "t.db"), save_interval=None)
+            try:
+                self.assertTrue(mgr.native)
+                mgr.addNode(5, [g(Op.INP), g(Op.OUTPUT, c0=1, c1=1)])
+                fired = []
+                for _ in range(3):
+                    mgr.activate(5, 0.5)
+                    fired.append(mgr.pump_events())
+                self.assertTrue(all(count > 0 for count in fired), fired)
+            finally:
+                mgr.close()
 
 
 if __name__ == "__main__":

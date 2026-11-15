@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -25,11 +26,16 @@ from .node import Gene, Node, Op
 # C 库文件名（按平台优先顺序尝试）。
 _LIBRARY_NAMES = ("libsmcgp_node.so", "smcgp_node.dll", "smcgp_node.so", "libsmcgp_node.dylib")
 
+# 全局内部节点（基因）总数上限：800 万（所有神经元共享；C/Python 两版同一数值）。
+MAX_TOTAL_GENES = 8_000_000
+
 
 def _bind_library(lib) -> None:
     """声明 C 接口签名；不声明的话 ctypes 会把 64 位指针截断成 int。"""
     lib.smcgp_create.restype = ctypes.c_void_p
     lib.smcgp_create.argtypes = [ctypes.c_int]
+    lib.smcgp_set_workers.restype = None
+    lib.smcgp_set_workers.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.smcgp_destroy.restype = None
     lib.smcgp_destroy.argtypes = [ctypes.c_void_p]
     lib.smcgp_set_base_seed.restype = None
@@ -73,6 +79,33 @@ def _bind_library(lib) -> None:
     lib.smcgp_stats.restype = None
     lib.smcgp_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_longlong),
                                 ctypes.POINTER(ctypes.c_longlong)]
+    # 可选接口：老版本 .so 没有它时不影响加载（用于“某些节点拒收路由输入”）。
+    try:
+        lib.smcgp_set_input_block.restype = None
+        lib.smcgp_set_input_block.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64]
+    except AttributeError:
+        pass
+    # 可选接口：控制台统计（保留区间内的节点不算“扩展神经元”）。
+    try:
+        lib.smcgp_set_reserved_ranges.restype = ctypes.c_int
+        lib.smcgp_set_reserved_ranges.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64), ctypes.c_int,
+        ]
+        lib.smcgp_activity.restype = None
+        lib.smcgp_activity.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_longlong), ctypes.POINTER(ctypes.c_longlong),
+            ctypes.POINTER(ctypes.c_longlong), ctypes.POINTER(ctypes.c_longlong),
+        ]
+    except AttributeError:
+        pass
+    # 可选接口：全局基因总数上限（默认 800 万）。
+    try:
+        lib.smcgp_set_total_gene_limit.restype = None
+        lib.smcgp_set_total_gene_limit.argtypes = [ctypes.c_void_p, ctypes.c_longlong]
+    except AttributeError:
+        pass
 
 
 def load_smcgp_library():
@@ -101,15 +134,39 @@ def load_smcgp_library():
 class nodemgr:
     """神经元群体：ID -> SMCGP14 图；原生模式由 C 引擎持有图与调度。"""
 
-    # 单次取回已触发节点 ID 的缓冲上限：dps=4 时节点上限 10000，足够。
-    FIRED_CAP = 65536
+    # 单次取回已触发节点 ID 的缓冲上限：dps=5 时节点上限 10 万，留足余量。
+    FIRED_CAP = 1 << 20
 
     def __init__(self, dps: int = 4, seed=None, db_path: str = "nodes.db",
-                 save_interval: Optional[float] = 2.0):
-        """创建群体；图结构存放在独立表 smcgp_nodes，不碰旧版 nodes 表。"""
+                 save_interval: Optional[float] = 2.0, blocked_range=None,
+                 reserved_ranges=None, max_total_genes: int = MAX_TOTAL_GENES):
+        """创建群体；图结构存放在独立表 smcgp_nodes，不碰旧版 nodes 表。
+
+        `blocked_range=(base, size)` 指定一段“拒收路由输入”的 ID 区间：
+        区间内节点（如刺激神经元）只响应显式 activate，别的神经元的消息一律丢弃。
+        `reserved_ranges=[(start, end), ...]` 是控制台统计用的保留区间：落在这些
+        区间里的神经元（视觉/操作感觉四组/刺激神经元）不计入“扩展神经元”统计。
+        `max_total_genes` 是全局内部节点（基因）总数上限（默认 800 万），
+        只在 ADD 生长时拦截，已存在的超大图不截断。
+        """
         self.dps = int(dps)
+        # 单神经元基因（内部节点）数量上限 = 2.5 × 10^dps（dps=5 -> 250000）。
+        # 只在 ADD 生长时拦截：已存在的超大神经元保持原图、不再增长（不截断）。
+        self.max_genes = int(2.5 * (10 ** self.dps))
+        # 全局内部节点（基因）总数上限：800 万，所有神经元共享（只拦截 ADD 生长）。
+        self.max_total_genes = int(max_total_genes)
+        # 纯 Python 回退的全局基因计数（原生模式由 C 引擎的 gene_total 负责）。
+        self._total_genes = 0
         self.seed = seed
         self.save_interval = save_interval
+        self.blocked_range = blocked_range
+        # 控制台统计用的保留区间（C 侧只拿到区间表，自己判断扩展神经元）。
+        self.reserved_ranges = [(int(start), int(end)) for start, end in (reserved_ranges or [])]
+        # 纯 Python 回退用的上一轮统计（C 引擎有自己的原子计数）。
+        self._stats_run_total = 0
+        self._stats_run_expanded = 0
+        self._stats_pending_total = 0
+        self._stats_pending_expanded = 0
         self.save_error: Optional[str] = None
         self.callbacks: Dict[int, object] = {}
         self._lock = threading.RLock()
@@ -127,12 +184,52 @@ class nodemgr:
                 if seed is not None:
                     base = (int(seed) * 2654435761 + 1) & 0xFFFFFFFFFFFFFFFF
                 self._lib.smcgp_set_base_seed(self._handle, ctypes.c_uint64(base))
+                # 一轮内的节点求值交给常驻 C 线程池：默认用整机核数（BTB_WORKERS 可覆盖）。
+                workers = int(os.environ.get("BTB_WORKERS", "0") or 0) or (os.cpu_count() or 1)
+                self._lib.smcgp_set_workers(self._handle, max(1, int(workers)))
+                # 拒收路由输入的区间（刺激神经元只接受显式激活）。
+                if blocked_range is not None:
+                    block_base, block_size = int(blocked_range[0]), int(blocked_range[1])
+                    block_setter = getattr(self._lib, "smcgp_set_input_block", None)
+                    if block_setter is not None:
+                        block_setter(self._handle, block_base, block_size)
+                        if os.environ.get("BTB_DEBUG") == "1":
+                            print(f"[nodeManager] 路由输入隔离区间 "
+                                  f"[{block_base}, {block_base + block_size})",
+                                  file=sys.stderr, flush=True)
+                # 统计保留区间：区间内的节点（视觉/四组/刺激）不算“扩展神经元”。
+                if self.reserved_ranges:
+                    range_setter = getattr(self._lib, "smcgp_set_reserved_ranges", None)
+                    if range_setter is not None:
+                        range_count = len(self.reserved_ranges)
+                        starts = (ctypes.c_int64 * range_count)(
+                            *[start for start, _ in self.reserved_ranges])
+                        ends = (ctypes.c_int64 * range_count)(
+                            *[end for _, end in self.reserved_ranges])
+                        range_setter(self._handle, starts, ends, range_count)
+                        if os.environ.get("BTB_DEBUG") == "1":
+                            print(f"[nodeManager] 统计保留区间 {self.reserved_ranges}"
+                                  "（区间外才算扩展神经元）", file=sys.stderr, flush=True)
+                # 全局内部节点（基因）总数上限：默认 800 万。
+                limit_setter = getattr(self._lib, "smcgp_set_total_gene_limit", None)
+                if limit_setter is not None:
+                    limit_setter(self._handle, ctypes.c_longlong(self.max_total_genes))
+                    if os.environ.get("BTB_DEBUG") == "1":
+                        print(f"[nodeManager] 全局基因总数上限 {self.max_total_genes:,}",
+                              file=sys.stderr, flush=True)
+                if os.environ.get("BTB_DEBUG") == "1":
+                    print(f"[nodeManager] C 线程池 {max(1, int(workers))} 条",
+                          file=sys.stderr, flush=True)
+                    print(f"[nodeManager] 单神经元基因上限 {self.max_genes}"
+                          f"（2.5 × 10^{self.dps}，C 引擎内部同一公式）",
+                          file=sys.stderr, flush=True)
         # 纯 Python 回退用：ID -> Node；原生模式只记录 ID 以便观测/落盘。
         self.cacheNodes: Dict[int, Node] = {}
         self._known_ids = set()
         self._pending: Dict[int, List[float]] = {}
         self._fired_buffer = (ctypes.c_int64 * self.FIRED_CAP)()
         self._id_buffer = (ctypes.c_int64 * self.FIRED_CAP)()
+        self._debug_rounds = 0
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db_lock = threading.Lock()
         self._db.execute(
@@ -160,11 +257,24 @@ class nodemgr:
     # ---------- 外层寻址 ----------
 
     def route_id(self, destination: float) -> int:
-        """外层寻址规则：目标编码向零截断取整、负值取绝对值，再对 10^dps 取模。"""
-        node_id = int(destination)
-        if node_id < 0:
-            node_id = -node_id
-        return node_id % (10 ** self.dps)
+        """外层寻址：把目标编码线性映射到整个 ID 空间（乘 10^dps 后对 10^dps 取模）。
+
+        只做截断取整会让节点算出的目标编码（通常是个位数）永远落在 0..16，
+        4000 以上的操作/感觉神经元永远收不到消息；乘上 10^dps 再取模后，
+        小数编码就能覆盖整个 ID 空间。
+        """
+        scaled = abs(float(destination)) * (10 ** self.dps)
+        if not math.isfinite(scaled):
+            scaled = 0.0
+        return int(scaled) % (10 ** self.dps)
+
+    def _target_blocked(self, target: int) -> bool:
+        """目标是否落在“拒收路由输入”的区间内（例如刺激神经元只接受显式激活）。"""
+        blocked = self.blocked_range
+        if blocked is None:
+            return False
+        base, size = int(blocked[0]), int(blocked[1])
+        return size > 0 and base <= target < base + size
 
     # ---------- 神经元创建与查询 ----------
 
@@ -185,8 +295,11 @@ class nodemgr:
         with self._lock:
             node = self.cacheNodes.get(node_id)
             if node is None:
-                node = Node(node_id, graph, seed=self.seed if seed is None else seed)
+                node = Node(node_id, graph, seed=self.seed if seed is None else seed,
+                            max_genes=self.max_genes)
                 self.cacheNodes[node_id] = node
+                # 纯 Python 回退：新建神经元的初始图也计入全局基因总数。
+                self._total_genes += len(node.graph)
             return node
 
     def getNode(self, node_id: int):
@@ -268,10 +381,20 @@ class nodemgr:
             fired_ids = [int(self._fired_buffer[i]) for i in range(min(fired, self.FIRED_CAP))]
             with self._lock:
                 self._known_ids.update(fired_ids)
+            group_hits = 0
             for node_id in fired_ids:
                 callback = self.callbacks.get(node_id)
                 if callback is not None and not self.stopped:
+                    group_hits += 1
                     callback({"id": node_id})
+            if os.environ.get("BTB_DEBUG") == "1":
+                self._debug_rounds += 1
+                if self._debug_rounds % 40 == 0:
+                    pending = len(self._native_pending_ids())
+                    print(f"[nodeManager] 轮次 {self._debug_rounds}：执行 {executed}，"
+                          f"触发 {len(fired_ids)}（去重 {len(set(fired_ids))}），"
+                          f"回调命中 {group_hits}，下一轮待执行 {pending}",
+                          file=sys.stderr, flush=True)
             if executed < 0:
                 self.save_error = "C 引擎执行失败"
             return len(fired_ids)
@@ -283,22 +406,35 @@ class nodemgr:
             pending, self._pending = self._pending, {}
         if not pending:
             return 0
+        # 纯 Python 回退的统计：本轮执行数 / 其中扩展神经元数。
+        self._stats_run_total = len(pending)
+        self._stats_run_expanded = sum(1 for node_id in pending if not self._is_reserved(node_id))
         deliveries: Dict[int, List[float]] = {}
         fired_ids = []
         for node_id in sorted(pending):
             node = self.getNodeFromCache(node_id) or self.getNode(node_id)
             if node is None:
                 continue
+            before = len(node.graph)
+            # 全局 800 万基因预算：折算成本拍该节点可用的单神经元上限。
+            self._apply_gene_budget(node)
             emissions = node.run(pending[node_id])
+            self._total_genes += len(node.graph) - before
             if emissions:
                 fired_ids.append(node_id)
             for emission in emissions:
                 target = self.route_id(emission.destination)
+                if self._target_blocked(target):
+                    continue
                 deliveries.setdefault(target, []).append(float(emission.value))
         with self._lock:
             for target, values in deliveries.items():
                 self.getNode(target)
                 self._pending.setdefault(target, []).extend(values)
+        # 下一轮待执行数 / 其中扩展神经元数。
+        self._stats_pending_total = len(self._pending)
+        self._stats_pending_expanded = sum(
+            1 for node_id in self._pending if not self._is_reserved(node_id))
         for node_id in fired_ids:
             callback = self.callbacks.get(node_id)
             if callback is not None and not self.stopped:
@@ -327,11 +463,18 @@ class nodemgr:
             node = self.getNode(node_id)
             if node is None:
                 continue
-            executed.append((node_id, node.run(pending_inputs[node_id])))
+            before = len(node.graph)
+            # 全局 800 万基因预算：折算成本拍该节点可用的单神经元上限。
+            self._apply_gene_budget(node)
+            emissions = node.run(pending_inputs[node_id])
+            self._total_genes += len(node.graph) - before
+            executed.append((node_id, emissions))
         deliveries = {}
         for _, emissions in executed:
             for emission in emissions:
                 target = self.route_id(emission.destination)
+                if self._target_blocked(target):
+                    continue
                 deliveries.setdefault(target, []).append(float(emission.value))
         with self._lock:
             for target, values in deliveries.items():
@@ -342,19 +485,59 @@ class nodemgr:
     # ---------- 统计 ----------
 
     def summary(self) -> dict:
-        """只统计数量，不构造节点列表。"""
+        """只统计数量，不构造节点列表。
+
+        `run_*` = 上一轮实际执行的神经元数（其中 `run_expanded` 只算扩展神经元）；
+        `pending_*` = 下一轮待执行的神经元数（其中 `pending_expanded` 只算扩展神经元）。
+        """
         if self._handle:
             nodes = ctypes.c_longlong(0)
             genes = ctypes.c_longlong(0)
             self._lib.smcgp_stats(self._handle, ctypes.byref(nodes), ctypes.byref(genes))
+            run_total = ctypes.c_longlong(0)
+            run_expanded = ctypes.c_longlong(0)
+            pending_total = ctypes.c_longlong(0)
+            pending_expanded = ctypes.c_longlong(0)
+            activity = getattr(self._lib, "smcgp_activity", None)
+            if activity is not None:
+                activity(self._handle, ctypes.byref(run_total), ctypes.byref(run_expanded),
+                         ctypes.byref(pending_total), ctypes.byref(pending_expanded))
             return {"stopped": self.stopped, "saved": self._closed,
                     "save_error": self.save_error,
-                    "nodes": int(nodes.value), "genes": int(genes.value)}
+                    "nodes": int(nodes.value), "genes": int(genes.value),
+                    "run_total": int(run_total.value),
+                    "run_expanded": int(run_expanded.value),
+                    "pending_total": int(pending_total.value),
+                    "pending_expanded": int(pending_expanded.value)}
         with self._lock:
             nodes = list(self.cacheNodes.values())
         return {"stopped": self.stopped, "saved": self._closed,
                 "save_error": self.save_error,
-                "nodes": len(nodes), "genes": sum(len(node.graph) for node in nodes)}
+                "nodes": len(nodes), "genes": sum(len(node.graph) for node in nodes),
+                "run_total": self._stats_run_total,
+                "run_expanded": self._stats_run_expanded,
+                "pending_total": self._stats_pending_total,
+                "pending_expanded": self._stats_pending_expanded}
+
+    def _is_reserved(self, node_id: int) -> bool:
+        """判断节点是否落在保留区间（视觉/四组/刺激）：区间内不计入扩展神经元统计。"""
+        node_id = int(node_id)
+        for start, end in self.reserved_ranges:
+            if start <= node_id < end:
+                return True
+        return False
+
+    def _apply_gene_budget(self, node) -> None:
+        """纯 Python 回退：把全局 800 万基因预算折算成本拍该节点可用的 max_genes。
+
+        剩余额度 = 全局上限 - 当前基因总数；节点最多只能长到 len(graph)+剩余额度，
+        再与单神经元上限取较小值（额度为 0 时等价于禁止 ADD 生长）。
+        """
+        if node is None:
+            return
+        remaining = self.max_total_genes - self._total_genes
+        allowance = len(node.graph) + max(0, remaining)
+        node.max_genes = min(self.max_genes, allowance)
 
     # ---------- 原生引擎的图读写 ----------
 
@@ -441,7 +624,10 @@ class nodemgr:
                 with self._lock:
                     self._known_ids.add(node_id)
             else:
-                self.cacheNodes[node_id] = Node(node_id, graph, seed=self.seed)
+                node = Node(node_id, graph, seed=self.seed, max_genes=self.max_genes)
+                self.cacheNodes[node_id] = node
+                # 纯 Python 回退：从库里载入的图也计入全局基因总数。
+                self._total_genes += len(node.graph)
 
     def saveNodeToDatabase(self, node_id: int) -> None:
         """把某个神经元标记为待落盘（后台批量写入）。"""

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADNN · 查看 SMCGP</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;
+    --panel: rgba(18, 24, 33, 0.94);
+    --line: #263041;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: radial-gradient(circle at 50% 30%, #101a26 0%, #0b0f14 70%);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    overflow: hidden;
+  }
+  #scene { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  header {
+    position: fixed; top: 0; left: 0; right: 0;
+    display: flex; align-items: center; gap: 14px;
+    padding: 12px 18px; pointer-events: none;
+    background: linear-gradient(180deg, rgba(11, 15, 20, 0.92), rgba(11, 15, 20, 0));
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  header a { pointer-events: auto; color: var(--accent); font-size: 12px; text-decoration: none; }
+  #stats { color: var(--muted); font-size: 12px; }
+  #panel {
+    position: fixed; top: 52px; left: 18px; width: 300px; max-height: calc(100vh - 90px);
+    display: flex; flex-direction: column; gap: 9px; overflow: auto;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; font-size: 12px; color: var(--muted);
+    backdrop-filter: blur(8px);
+  }
+  #panel .row { display: flex; gap: 6px; align-items: center; }
+  #panel label { white-space: nowrap; }
+  #panel input[type="number"] {
+    width: 92px; background: #0f1620; border: 1px solid var(--line);
+    border-radius: 6px; color: var(--text); padding: 4px 6px; font-size: 12px;
+  }
+  #panel input[type="number"]:focus { outline: none; border-color: var(--accent); }
+  #panel select {
+    background: #0f1620; border: 1px solid var(--line); border-radius: 6px;
+    color: var(--text); padding: 4px 6px; font-size: 12px;
+  }
+  #panel button {
+    background: #1f6feb; color: #fff; border: 0; border-radius: 6px;
+    padding: 5px 10px; font-size: 12px; cursor: pointer;
+  }
+  #panel button.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
+  #ops { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; }
+  #ops span { display: inline-flex; align-items: center; gap: 4px; }
+  #ops i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  #detail {
+    position: fixed; right: 18px; top: 52px; width: 300px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; font-size: 12px; line-height: 1.7; color: var(--muted);
+    backdrop-filter: blur(8px); max-height: calc(100vh - 90px); overflow: auto;
+  }
+  #detail strong { color: var(--text); font-size: 14px; }
+  #detail code { color: #a5d6ff; }
+  #detail table { width: 100%; border-collapse: collapse; }
+  #detail td { padding: 1px 0; }
+  #detail td:last-child { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+  #detail .link { color: var(--accent); cursor: pointer; text-decoration: underline; }
+  #tooltip {
+    position: fixed; z-index: 5; pointer-events: none;
+    background: rgba(15, 21, 29, 0.97); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 9px; font-size: 12px; line-height: 1.5;
+    color: var(--text); white-space: nowrap; display: none;
+  }
+  #message {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 14px; color: var(--text); background: rgba(11, 15, 20, 0.86);
+  }
+  #message.hidden { display: none; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<header>
+  <h1 id="title">ADNN · SMCGP 图</h1>
+  <div id="stats"></div>
+  <a href="/" style="margin-left:auto">← 返回三维网络</a>
+</header>
+<section id="panel">
+  <div class="row"><label>起始下标</label><input id="start" type="number" min="0" step="1" value="0"></div>
+  <div class="row">
+    <label>显示数量</label>
+    <select id="count">
+      <option value="500">500</option>
+      <option value="1500" selected>1500</option>
+      <option value="3000">3000</option>
+      <option value="6000">6000</option>
+    </select>
+  </div>
+  <div class="row">
+    <label><input id="only-reachable" type="checkbox"> 只看 OUTPUT 可达</label>
+  </div>
+  <div class="row">
+    <label><input id="hide-const" type="checkbox"> 隐藏 CONST</label>
+  </div>
+  <div class="row">
+    <button id="apply">刷新视图</button>
+    <button id="last" class="ghost">跳到末尾</button>
+  </div>
+  <div class="row"><label>定位下标</label><input id="goto" type="number" min="0" step="1" placeholder="索引"><button id="goto-btn" class="ghost">跳转</button></div>
+  <div id="ops"></div>
+</section>
+<div id="detail">点击基因节点查看指令与参数</div>
+<div id="tooltip"></div>
+<div id="message">正在读取数据库…</div>
+<script src="/smcgp.js"></script>
+</body>
+</html>

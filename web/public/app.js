@@ -510,9 +510,20 @@ function handleState(message) {
   ui.score.textContent = `${game.score_left} : ${game.score_right}`;
   drawPong(game);
 
+  // 控制台只统计“扩展神经元”（保留区间 0–7199 与 10000–19999 之外）：
+  //   run_expanded     = 本轮实际执行的扩展神经元数（激活神经元数）
+  //   pending_expanded = 下一轮待执行的扩展神经元数（当前计算中的节点数）
+  const runExpanded = Number.isFinite(net.run_expanded) ? net.run_expanded : 0;
+  const pendingExpanded = Number.isFinite(net.pending_expanded) ? net.pending_expanded : 0;
+  // 刺激神经元激活数：本拍实际激活（移动刺激 + 触拍/得分刺激包）与运行以来累计。
+  const stimActive = Number.isFinite(game.stim_active) ? game.stim_active : 0;
+  const stimTotal = Number.isFinite(game.stim_total) ? game.stim_total : 0;
   ui.stats.textContent =
     `${net.stopped ? (net.saved ? '已停止并落盘' : '正在停止') : '运行中'}`
     + ` | 节点 ${net.nodes} | 内部节点 ${net.genes}`
+    + ` | 激活神经元(扩展) ${runExpanded.toLocaleString()}`
+    + ` | 计算中节点(扩展) ${pendingExpanded.toLocaleString()}`
+    + ` | 刺激激活 ${stimActive.toLocaleString()}（累计 ${stimTotal.toLocaleString()}）`
     + ` | 帧率 ${Number.isFinite(message.fps) ? message.fps.toFixed(1) : '-'}`
     + (net.save_error ? ` | 保存异常：${net.save_error}` : '');
 }

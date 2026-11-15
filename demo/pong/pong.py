@@ -24,14 +24,28 @@ class Pong:
         self._command_lock = threading.Lock()
         self._right_up = 0
         self._right_down = 0
+        # UP / DOWN 操作互斥：本拍第一个触发方向锁定，另一个方向的指令直接丢弃。
+        self._right_dir = None
+        # 被互斥丢弃的指令数（观测/调试用）。
+        self.blocked_up = 0
+        self.blocked_down = 0
         self.commanded_up = 0
         self.commanded_down = 0
         self.ball_out = False        # 球出画面时置 True，读取后由外部清除
         # 出界方向：'left' = 球从左边界飞出（左桨漏球，右玩家得分）；
         #           'right' = 球从右边界飞出（右桨漏球，左玩家得分）。
-        # adapter 用它区分 dopamine 规则，读取后由外部清除。
+        # 目前仅保留为观测字段。
         self.out_side = None
         self.paddle_hit = False      # 右桨击中球时置 True，读取后由外部清除
+        # 右桨触球的次数（累加计数）：adapter 用它计算连续触拍次数并激活刺激神经元。
+        self.hit_events = 0
+        # 最后一次触球的是哪一侧桨（'left' / 'right' / None）：计分时只有
+        # “该侧桨最后把球打出去”造成的出界才算该侧得分，否则只记到丢弃计数里。
+        self.last_hit_side = None
+        # 未计入得分的出界次数（观测/调试用）：left = 球从右出界但不是左桨打的，
+        # right = 球从左出界但不是右桨打的。
+        self.discarded_left = 0
+        self.discarded_right = 0
         self.paddle_moved_up = 0
         self.paddle_moved_down = 0
         # 视觉输入位图（ROWS*COLS 字节，0/1）：每拍只按增量刷新，供 C 引擎直接投喂，
@@ -42,11 +56,21 @@ class Pong:
     def move_right_up(self, val):
         if val == 1:
             with self._command_lock:
+                # 互斥：本拍 DOWN 已经先触发，本条 UP 指令作废。
+                if self._right_dir == "down":
+                    self.blocked_up += 1
+                    return
+                self._right_dir = "up"
                 self._right_up += 1
 
     def move_right_down(self, val):
         if val == 1:
             with self._command_lock:
+                # 互斥：本拍 UP 已经先触发，本条 DOWN 指令作废。
+                if self._right_dir == "up":
+                    self.blocked_down += 1
+                    return
+                self._right_dir = "down"
                 self._right_down += 1
 
     def update(self):
@@ -57,25 +81,35 @@ class Pong:
             self.dy = -self.dy
 
         # 只有球“正朝桨飞”时才反弹：否则球停在 x=0/1 会被两侧判定反复翻转 dx，
-        # 卡在边缘来回一次、永远打不出去（表现为比分与 dopamine 长时间不变化）。
+        # 卡在边缘来回一次、永远打不出去（表现为比分长时间不变化）。
         if (self.dx < 0 and self.ball_x <= 1
                 and self.left_paddle_y <= self.ball_y < self.left_paddle_y + PADDLE_HEIGHT):
+            # 左桨（AI 侧）触球只反弹，不累加 hit_events：刺激神经元只统计右桨触拍。
             self.dx = -self.dx
+            self.last_hit_side = "left"
 
         if (self.dx > 0 and self.ball_x >= COLS - 2
                 and self.right_paddle_y <= self.ball_y < self.right_paddle_y + PADDLE_HEIGHT):
             self.dx = -self.dx
             self.paddle_hit = True
+            self.hit_events += 1
+            self.last_hit_side = "right"
 
         if self.ball_x < 0:
-            # 球从左边界飞出：左桨漏球，右玩家得分。
-            self.score_right += 1
+            # 球从左边界飞出（左桨漏球）。只有“右桨最后把球打出去”才算右玩家得分。
+            if self.last_hit_side == "right":
+                self.score_right += 1
+            else:
+                self.discarded_right += 1
             self.out_side = "left"
             self.ball_out = True
             self._reset()
         elif self.ball_x >= COLS:
-            # 球从右边界飞出：右桨漏球，左玩家得分。
-            self.score_left += 1
+            # 球从右边界飞出（右桨漏球）。只有“左桨最后把球打出去”才算左玩家得分。
+            if self.last_hit_side == "left":
+                self.score_left += 1
+            else:
+                self.discarded_left += 1
             self.out_side = "right"
             self.ball_out = True
             self._reset()
@@ -90,6 +124,8 @@ class Pong:
         self.ball_y = ROWS // 2
         self.dx = random.choice([1, -1])
         self.dy = random.choice([1, -1])
+        # 新一回合开始：还没人触球，因此本回合的出界默认不计分。
+        self.last_hit_side = None
 
     def _move_left_ai(self):
         target = self.ball_y - 1
@@ -102,10 +138,17 @@ class Pong:
         with self._command_lock:
             self.commanded_up, self.commanded_down = self._right_up, self._right_down
             self._right_up = self._right_down = 0
+            # 本拍指令已消费，解除互斥锁，下一拍重新由第一个触发的方向决定。
+            self._right_dir = None
+        # 右桨移动速度上限 1 像素/帧：本拍收到的多条指令只取净位移，再夹到 [-1, 1]；
+        # 超过 1 像素/帧的部分直接丢弃，保证每拍最多移动一格。
+        delta = self.commanded_down - self.commanded_up
+        if delta > 1:
+            delta = 1
+        elif delta < -1:
+            delta = -1
         before = self.right_paddle_y
-        self.right_paddle_y = max(
-            0, min(ROWS - PADDLE_HEIGHT, before + self.commanded_down - self.commanded_up)
-        )
+        self.right_paddle_y = max(0, min(ROWS - PADDLE_HEIGHT, before + delta))
         self.paddle_moved_up = max(0, before - self.right_paddle_y)
         self.paddle_moved_down = max(0, self.right_paddle_y - before)
 

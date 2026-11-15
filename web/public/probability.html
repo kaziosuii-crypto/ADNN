@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ADNN 连接概率</title>
+<title>ADNN · SMCGP 结构统计</title>
 <style>
   :root {
     color-scheme: dark;
@@ -34,31 +34,46 @@
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   td { padding: 4px 0; border-bottom: 1px solid var(--line); color: var(--muted); }
   td:last-child { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+  #types { display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; }
+  #types .item { display: flex; align-items: center; gap: 7px; background: #0f1620; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+  #types i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  #top a { color: var(--accent); text-decoration: none; }
+  #top a:hover { text-decoration: underline; }
   #empty { color: var(--muted); font-size: 13px; padding: 20px 0; }
   @media (max-width: 1000px) { .cards { grid-template-columns: repeat(2, 1fr); } body { padding: 18px; } }
 </style>
 </head>
 <body>
 <header>
-  <h1>ADNN · 连接传播概率</h1>
+  <h1>ADNN · SMCGP 结构统计</h1>
   <span id="meta">正在读取数据库…</span>
 </header>
 <section class="cards" id="cards"></section>
 <section class="panel">
-  <h2>概率分布</h2>
-  <p class="sub">概率 = min(1, 连接权重)，按 10% 分箱统计连接条数</p>
-  <canvas id="histogram"></canvas>
+  <h2>神经元类型</h2>
+  <p class="sub">按 ID 区间划分：视觉 0–3999 / 操作·感觉 4000–7199 / 刺激 10000–19999 / 扩张其余</p>
+  <div id="types"></div>
 </section>
 <section class="panel">
-  <h2>每条连接的概率</h2>
-  <p class="sub">按概率降序；纵轴为对数刻度，虚线为 50%</p>
-  <canvas id="strip"></canvas>
+  <h2>指令分布</h2>
+  <p class="sub">14 种 SMCGP14 指令在全部神经元里出现的次数（纵轴对数刻度）</p>
+  <canvas id="ops"></canvas>
 </section>
 <section class="panel">
-  <h2>最强连接</h2>
+  <h2>基因数分布</h2>
+  <p class="sub">每个神经元有多少基因（按区间分箱统计神经元个数）</p>
+  <canvas id="sizes"></canvas>
+</section>
+<section class="panel">
+  <h2>相对连接距离</h2>
+  <p class="sub">c0 / c1 指向前面第几个基因；0 = 该位不连接（读作 0），&gt;16 = 远距离引用</p>
+  <canvas id="distances"></canvas>
+</section>
+<section class="panel">
+  <h2>最大神经元 Top 10</h2>
   <div id="top"></div>
 </section>
-<div id="empty" hidden>数据库中没有连接。请先在控制台启动网络并等待节点完成激活窗口。</div>
+<div id="empty" hidden>数据库中没有 SMCGP 神经元。请先在控制台启动网络并“强制结束网络并落盘”。</div>
 <script src="/probability.js"></script>
 </body>
 </html>

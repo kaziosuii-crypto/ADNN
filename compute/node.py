@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 from dataclasses import dataclass
 from enum import IntEnum
@@ -40,8 +41,8 @@ class Op(IntEnum):
 SELF_MODIFY_OPS = frozenset({Op.ADD, Op.DEL, Op.MOV, Op.CHC, Op.CHF, Op.FLR, Op.CHP})
 
 # ---- 固定的边界规则（写死在这里并被单元测试锁定）----
-# 单条 ADD 一轮最多插入的随机节点数，避免自修改爆图。
-MAX_ADD_GENES = 32
+# 单条 ADD 一轮最多插入的节点数（16·sin(x) 映射的上界，防止自修改爆图）。
+MAX_ADD_GENES = 16
 # 随机初始化参数范围（与设计文档示例一致，仅用于新建内部节点）。
 RANDOM_RANGE = 16
 
@@ -93,6 +94,19 @@ def distribute_inputs(values: Sequence[float], count: int) -> List[float]:
     return [values[slot % total] for slot in range(count)]
 
 
+def add_gene_count(trigger: float) -> int:
+    """ADD 插入的节点数量：16·sin(x) 把所有实数映射到 [-16,16]，取绝对值后四舍五入。
+
+    结果再夹到 1..MAX_ADD_GENES（=16），因此对任意实数 x 都会插入 1~16 个节点。
+    取整用 floor(|y| + 0.5)，与 C 版 `add_count_from_value` 完全一致。
+    """
+    scaled = 16.0 * math.sin(float(trigger))
+    if not math.isfinite(scaled):
+        scaled = 0.0
+    count = math.floor(abs(scaled) + 0.5)
+    return int(_clamp(count, 1, MAX_ADD_GENES))
+
+
 class Node:
     """SMCGP14 神经元：执行内部图、处理自修改、保存/加载图结构。
 
@@ -102,11 +116,17 @@ class Node:
         node.save(path) / Node.load(path)
     """
 
-    def __init__(self, node_id: int, graph: Iterable[Gene] | None = None, seed=None):
-        """创建一个神经元；未提供图时按随机种子图生成（保证至少一个 INP 与一个 OUTPUT）。"""
+    def __init__(self, node_id: int, graph: Iterable[Gene] | None = None, seed=None,
+                 max_genes: int | None = None):
+        """创建一个神经元；未提供图时按随机种子图生成（保证至少一个 INP 与一个 OUTPUT）。
+
+        `max_genes` 是单神经元基因（内部节点）数量上限（由 nodeManager 按
+        2.5 × 10^dps 传入）。只在 ADD 生长时拦截：已存在的超大图不截断。
+        """
         self.id = int(node_id)
         self.rng = random.Random(seed)
         self.graph: List[Gene] = list(graph) if graph is not None else self._seed_graph()
+        self.max_genes = None if max_genes is None else int(max_genes)
         # 完整自修改日志（实验观测用，不参与计算）。
         self.modification_log: List[dict] = []
         self._round = 0
@@ -156,7 +176,7 @@ class Node:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
 
     @classmethod
-    def load(cls, path: str, seed=None) -> "Node":
+    def load(cls, path: str, seed=None, max_genes: int | None = None) -> "Node":
         """从磁盘恢复图结构；运行时数据（输入、输出、修改队列）不恢复。"""
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -165,7 +185,7 @@ class Node:
                  float(item["p0"]), float(item.get("p1", 0.0)), float(item.get("p2", 0.0)))
             for item in payload.get("graph", [])
         ]
-        return cls(payload.get("id", 0), graph, seed=seed)
+        return cls(payload.get("id", 0), graph, seed=seed, max_genes=max_genes)
 
     # ---------- 内部执行 ----------
 
@@ -256,8 +276,9 @@ class Node:
             a = self._read(index, gene.c0)
             b = self._read(index, gene.c1)
             if a >= b:
-                # 触发：登记修改请求，返回 a；未触发则返回 b。
-                self._modifications.append((index, op, float(gene.p0), float(gene.p1), float(gene.p2)))
+                # 触发：登记修改请求（带上触发值 a，ADD 用它决定插入数量），返回 a。
+                self._modifications.append(
+                    (index, op, float(gene.p0), float(gene.p1), float(gene.p2), float(a)))
                 return a
             return b
         return 0.0
@@ -268,14 +289,14 @@ class Node:
         self._modifications = []
         position = 0
         while position < len(queue):
-            index, op, p0, p1, p2 = queue[position]
+            index, op, p0, p1, p2, trigger = queue[position]
             position += 1
             if op is Op.FLR:
                 # FLR 清空尚未提交的其余请求，本身不改变图结构。
                 self._log(index, op, p0, p1, p2)
                 queue.clear()
                 break
-            if self._apply(index, op, p0, p1, p2):
+            if self._apply(index, op, p0, p1, p2, trigger):
                 self._log(index, op, p0, p1, p2)
 
     def _log(self, index: int, op: Op, p0: float, p1: float, p2: float) -> None:
@@ -290,13 +311,24 @@ class Node:
 
     # ---------- 7 种自修改的具体边界行为 ----------
 
-    def _apply(self, index: int, op: Op, p0: float, p1: float, p2: float) -> bool:
-        """执行一条自修改；返回是否真的改变了图结构（越界/无效修改返回 False）。"""
+    def _apply(self, index: int, op: Op, p0: float, p1: float, p2: float,
+               trigger: float = 0.0) -> bool:
+        """执行一条自修改；返回是否真的改变了图结构（越界/无效修改返回 False）。
+
+        `trigger` 是该自修改节点本轮算出的输入值 a（只有 ADD 会用到）。
+        """
         size = len(self.graph)
         if op is Op.ADD:
-            # 插入位置 = 当前节点位置 + p0（夹到 [0, len]），数量 = p1（0..MAX_ADD_GENES）。
+            # 插入位置 = 当前节点位置 + p0（夹到 [0, len]）；
+            # 数量 = 16·sin(触发值) 取绝对值四舍五入后夹到 1..16（不再是随机/由 p1 决定）。
             start = _clamp(index + int(p0), 0, size)
-            count = _clamp(int(p1), 0, MAX_ADD_GENES)
+            count = add_gene_count(trigger)
+            if self.max_genes is not None:
+                # 单神经元基因上限：只允许长到上限，超出部分直接丢弃。
+                room = self.max_genes - size
+                if room <= 0:
+                    return False
+                count = min(count, room)
             if count <= 0:
                 return False
             self.graph[start:start] = [self._random_gene() for _ in range(count)]

@@ -78,7 +78,11 @@ def main():
               "fps": round(runtime.fps, 2)})
         if DEBUG and state_frames % 20 == 0:
             _debug("状态帧", state_frames, "帧率", round(runtime.fps, 2),
-                   "节点", summary["nodes"], "激活", summary["active"], "连接", summary["edges"])
+                   "节点", summary["nodes"], "内部节点", summary["genes"],
+                   "扩展 执行", summary.get("run_expanded"),
+                   "待执行", summary.get("pending_expanded"),
+                   "刺激 本拍", game_state.get("stim_active"),
+                   "累计", game_state.get("stim_total"))
 
     # 把 state 推送绑到游戏节拍上；bridge 主线程只负责命令与收尾。
     runtime.on_state = emit_state

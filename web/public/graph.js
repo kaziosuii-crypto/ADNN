@@ -1,7 +1,9 @@
 'use strict';
 
 // 三维网络图：访问页面时从 /api/graph 读取一次数据库，客户端完成布局与渲染。
-// 默认只绘制节点；选中节点后只画它的连接线：红=入边，黄=出边，蓝=双向。
+// 数据现在是 SMCGP14 的 smcgp_nodes：节点 = 神经元，节点值 = 神经元类型下标；
+// 入度 = 该神经元图里 INP 基因的个数，出度 = OUTPUT 基因的个数，基因 = 基因总数。
+// 神经元之间没有持久化的边，点击节点后可在详情里点“查看 SMCGP”看它内部的图。
 
 const canvas = document.getElementById('scene');
 const context = canvas.getContext('2d');
@@ -30,6 +32,7 @@ const HALF_OFFSETS = [
 
 let ids = new Int32Array(0);
 let values = new Float32Array(0);
+let geneCounts = new Float32Array(0);
 let degree = new Int32Array(0);
 let inDeg = new Int32Array(0);
 let outDeg = new Int32Array(0);
@@ -51,6 +54,8 @@ let edgeCount = 0;
 let adjacency = [];
 let nodeCount = 0;
 let maxDegree = 1;
+let types = [];              // 神经元类型（视觉/操作感觉/刺激/扩张），来自 /api/graph
+let typeEnabled = [];        // 各类型是否显示
 let visible = new Uint8Array(0);
 let nodeIndex = new Map();
 
@@ -95,6 +100,36 @@ function clamp(value, low, high) {
   return value < low ? low : value > high ? high : value;
 }
 
+/** 神经元类型下标 -> 显示名（来自 /api/graph 的 types）。 */
+function typeLabel(type) {
+  const entry = types[type];
+  return entry ? entry.label : '未知';
+}
+
+/** 神经元类型下标 -> 颜色。 */
+function typeColor(type) {
+  const entry = types[type];
+  return entry ? entry.color : '#8b949e';
+}
+
+/** 生成面板里的“按神经元类型显示”复选框，以及底部类型图例。 */
+function renderTypeFilters() {
+  const container = document.getElementById('type-filters');
+  const legend = document.getElementById('legend');
+  if (!container) return;
+  container.innerHTML = types.map((entry, type) => (
+    `<label style="display:flex;align-items:center;gap:6px;margin:2px 0">`
+    + `<input type="checkbox" id="type-${type}" checked>`
+    + `<i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${entry.color}"></i>`
+    + `${entry.label}</label>`
+  )).join('');
+  if (legend) {
+    legend.innerHTML = types.map((entry) => (
+      `<span><i style="background:${entry.color}"></i>${entry.label}</span>`
+    )).join('');
+  }
+}
+
 function mulberry32(seed) {
   let state = seed >>> 0;
   return function random() {
@@ -113,6 +148,8 @@ function showMessage(message) {
 }
 
 function prepare(payload) {
+  types = Array.isArray(payload.types) ? payload.types : [];
+  typeEnabled = types.map(() => true);
   const nodeRows = payload.nodes || [];
   const edgeRows = payload.edges || [];
   nodeCount = nodeRows.length;
@@ -122,8 +159,8 @@ function prepare(payload) {
   nodeIndex = new Map();
   for (let i = 0; i < nodeCount; i++) {
     ids[i] = nodeRows[i][0];
-    const value = Number(nodeRows[i][1]);
-    values[i] = Number.isFinite(value) ? clamp(value, 0, 1) : 0;
+    // 三维页展示的是神经元：这里的“值”是类型下标（不是基因数）。
+    values[i] = Number.isFinite(Number(nodeRows[i][1])) ? Number(nodeRows[i][1]) : 3;
     nodeIndex.set(ids[i], i);
   }
 
@@ -135,6 +172,16 @@ function prepare(payload) {
   degree = new Int32Array(nodeCount);
   inDeg = new Int32Array(nodeCount);
   outDeg = new Int32Array(nodeCount);
+  geneCounts = new Float32Array(nodeCount);
+  // SMCGP 语义：入度 = 该神经元图里 INP 基因的数量（输入槽），
+  //            出度 = 该神经元图里 OUTPUT 基因的数量（每轮最多发出几条消息）。
+  for (let i = 0; i < nodeCount; i++) {
+    const row = nodeRows[i];
+    geneCounts[i] = Number(row[2]) || 0;
+    inDeg[i] = Number(row[3]) || 0;
+    outDeg[i] = Number(row[4]) || 0;
+    degree[i] = inDeg[i] + outDeg[i];
+  }
   let count = 0;
   for (const row of edgeRows) {
     const source = nodeIndex.get(row[0]);
@@ -171,6 +218,8 @@ function prepare(payload) {
   for (let i = 0; i < nodeCount; i++) {
     if (degree[i] > maxDegree) maxDegree = degree[i];
   }
+
+  renderTypeFilters();
 
   px = new Float32Array(nodeCount);
   py = new Float32Array(nodeCount);
@@ -420,8 +469,9 @@ function defaultZoom() {
 }
 
 function startLayout() {
-  const iterations = nodeCount > 30000 ? 60 : nodeCount > 10000 ? 96 : 150;
-  const chunk = nodeCount > 30000 ? 6 : 8;
+  // 节点可能到十万级：越大的图迭代次数越少，避免页面长时间卡在布局阶段。
+  const iterations = nodeCount > 60000 ? 36 : nodeCount > 30000 ? 60 : nodeCount > 10000 ? 96 : 150;
+  const chunk = nodeCount > 60000 ? 3 : nodeCount > 30000 ? 6 : 8;
   let iteration = 0;
   const started = performance.now();
   loadingText.textContent = '计算三维布局… 0%';
@@ -447,9 +497,9 @@ function updateStats() {
     if (edgeVisible[edge]) shownEdges += 1;
   }
   const prefix = shownNodes === nodeCount ? '' : `显示 ${shownNodes.toLocaleString()} / `;
-  statsEl.textContent = `${prefix}${nodeCount.toLocaleString()} 节点 · ${shownEdges.toLocaleString()} / ${edgeCount.toLocaleString()} 连接 · 布局 ${Math.round(layoutMs)} ms`;
+  statsEl.textContent = `${prefix}${nodeCount.toLocaleString()} 神经元 · 布局 ${Math.round(layoutMs)} ms`;
   if (ready) {
-    filterInfoEl.textContent = `可见 ${shownNodes.toLocaleString()} 节点 · ${shownEdges.toLocaleString()} 条边`;
+    filterInfoEl.textContent = `可见 ${shownNodes.toLocaleString()} 神经元`;
   }
 }
 
@@ -506,28 +556,25 @@ function drawNodes() {
   const colorBuckets = 6;
   const depthBuckets = 3;
   const paths = Array.from({ length: colorBuckets * depthBuckets }, () => new Path2D());
-  const degreeScale = 1 / Math.log1p(maxDegree);
-
   for (let i = 0; i < nodeCount; i++) {
     if (!visible[i]) continue;
-    const weight = Math.log1p(degree[i]) * degreeScale;
-    const colorIndex = clamp(Math.floor(weight * colorBuckets), 0, colorBuckets - 1);
+    // 颜色 = 神经元类型（视觉/操作感觉/刺激/扩张），不按基因数着色。
+    const colorIndex = clamp(Math.round(values[i]), 0, colorBuckets - 1);
     const depthIndex = clamp(Math.floor((depthZ[i] + 1) / 2 * depthBuckets), 0, depthBuckets - 1);
-    const grow = 0.7 + Math.min(degree[i], 40) * 0.05;
-    const size = clamp(base * grow * (persp[i] / 0.5), 0.6, 9);
+    const size = clamp(base * (persp[i] / 0.5), 0.8, 6);
     const path = paths[colorIndex * depthBuckets + depthIndex];
     path.rect(sx[i] - size / 2, sy[i] - size / 2, size, size);
   }
 
   const alphas = [0.96, 0.74, 0.5];
   for (let colorIndex = 0; colorIndex < colorBuckets; colorIndex++) {
-    const weight = (colorIndex + 0.5) / colorBuckets;
-    const hue = 205 - 180 * weight;
     for (let depthIndex = 0; depthIndex < depthBuckets; depthIndex++) {
-      context.fillStyle = `hsla(${hue}, 82%, 63%, ${alphas[depthIndex]})`;
+      context.fillStyle = typeColor(colorIndex);
+      context.globalAlpha = alphas[depthIndex];
       context.fill(paths[colorIndex * depthBuckets + depthIndex]);
     }
   }
+  context.globalAlpha = 1;
 }
 
 // 只在选中节点时绘制它自己的连接线：红=入边，黄=出边，蓝=双向。
@@ -603,7 +650,8 @@ function showTooltip(index, clientX, clientY) {
   tooltipEl.style.display = 'block';
   tooltipEl.style.left = `${clientX + 14}px`;
   tooltipEl.style.top = `${clientY + 14}px`;
-  tooltipEl.textContent = `#${ids[index]} · 数值 ${values[index].toFixed(4)} · 入度 ${inDeg[index]} · 出度 ${outDeg[index]}`;
+  // 入度/出度直接等于该神经元图里 INP / OUTPUT 基因的个数。
+  tooltipEl.textContent = `#${ids[index]} · ${typeLabel(Math.round(values[index]))} · 入度 ${inDeg[index]} · 出度 ${outDeg[index]} · 基因 ${geneCounts[index]}`;
 }
 
 function hideTooltip() {
@@ -635,30 +683,51 @@ function showDetail(index) {
   const outgoingRows = rows(outgoing, '#e3b341');
 
   const hiddenHint = (hidden, total) => hidden && hidden === total ? '（邻居均被筛选隐藏，连线仍会画出）' : '';
-
-  detailEl.innerHTML = `
-    <strong>节点 #${ids[index]}</strong><br>
-    数值 <code>${values[index].toFixed(6)}</code> · 入度 ${inDeg[index]} · 出度 ${outDeg[index]}
+  const edgeSections = edgeCount > 0 ? `
     <div class="section">入边（红）${incoming.length} 条</div>
     ${incomingRows ? `<table>${incomingRows}</table>` : '<div>没有入边</div>'}
     ${hiddenHint(incomingHidden, incoming.length)}
     <div class="section">出边（黄）${outgoing.length} 条</div>
     ${outgoingRows ? `<table>${outgoingRows}</table>` : '<div>没有出边</div>'}
-    ${hiddenHint(outgoingHidden, outgoing.length)}
+    ${hiddenHint(outgoingHidden, outgoing.length)}` : '';
+
+  detailEl.innerHTML = `
+    <strong>神经元 #${ids[index]}</strong><br>
+    类型 <code>${typeLabel(Math.round(values[index]))}</code><br>
+    入度（INP）<code>${inDeg[index]}</code> · 出度（OUTPUT）<code>${outDeg[index]}</code> · 基因数 <code>${geneCounts[index]}</code>
+    <div class="section">
+      <button id="open-smcgp" style="background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer">
+        查看 SMCGP
+      </button>
+    </div>
+    ${edgeSections}
   `;
+  const button = document.getElementById('open-smcgp');
+  if (button) {
+    button.addEventListener('click', () => {
+      window.open(`/smcgp.html?id=${ids[index]}`, '_blank');
+    });
+  }
 }
 
 function showingColor(shown, color) {
   return shown ? color : 'rgba(139, 148, 158, 0.45)';
 }
 
+/** 读取面板里的数字输入；空值返回 fallback。 */
 function readNumber(id, fallback) {
-  const raw = document.getElementById(id).value.trim();
+  const element = document.getElementById(id);
+  if (!element) return fallback;
+  const raw = element.value.trim();
   if (raw === '') return fallback;
   const value = Number(raw);
   return Number.isFinite(value) ? value : fallback;
 }
 
+/**
+ * 应用筛选：神经元类型复选框 + 入度（INP 数）/ 出度（OUTPUT 数）/ 基因数区间。
+ * 入度 = 图里 INP 基因个数，出度 = 图里 OUTPUT 基因个数。
+ */
 function applyFilters() {
   filter.inMin = readNumber('f-in-min', -Infinity);
   filter.inMax = readNumber('f-in-max', Infinity);
@@ -666,32 +735,32 @@ function applyFilters() {
   filter.outMax = readNumber('f-out-max', Infinity);
   filter.valueMin = readNumber('f-value-min', -Infinity);
   filter.valueMax = readNumber('f-value-max', Infinity);
-  filter.weightMin = readNumber('f-weight-min', -Infinity);
-  filter.weightMax = readNumber('f-weight-max', Infinity);
 
   let changed = false;
   let nodesChanged = false;
+  for (let type = 0; type < types.length; type++) {
+    const box = document.getElementById(`type-${type}`);
+    const enabled = box ? box.checked : true;
+    if (typeEnabled[type] !== enabled) {
+      typeEnabled[type] = enabled;
+      nodesChanged = true;
+    }
+  }
   for (let i = 0; i < nodeCount; i++) {
-    const next = inDeg[i] >= filter.inMin && inDeg[i] <= filter.inMax
+    const next = typeEnabled[Math.round(values[i])]
+      && inDeg[i] >= filter.inMin && inDeg[i] <= filter.inMax
       && outDeg[i] >= filter.outMin && outDeg[i] <= filter.outMax
-      && values[i] >= filter.valueMin && values[i] <= filter.valueMax ? 1 : 0;
+      && geneCounts[i] >= filter.valueMin && geneCounts[i] <= filter.valueMax ? 1 : 0;
     if (visible[i] !== next) {
       visible[i] = next;
       changed = true;
       nodesChanged = true;
     }
   }
-  for (let edge = 0; edge < edgeCount; edge++) {
-    const next = edgeW[edge] >= filter.weightMin && edgeW[edge] <= filter.weightMax ? 1 : 0;
-    if (edgeVisible[edge] !== next) {
-      edgeVisible[edge] = next;
-      changed = true;
-    }
-  }
 
   if (selected >= 0 && !visible[selected]) {
     selected = -1;
-    detailEl.textContent = '选中节点已被筛选隐藏';
+    detailEl.textContent = '选中神经元已被筛选隐藏';
   } else if (selected >= 0) {
     showDetail(selected);
   }
@@ -709,9 +778,15 @@ function applyFilters() {
   requestRender();
 }
 
+/** 恢复显示全部神经元：重置类型复选框，并清空入度/出度/基因数区间输入。 */
 function resetFilters() {
-  for (const id of ['f-in-min', 'f-in-max', 'f-out-min', 'f-out-max', 'f-value-min', 'f-value-max', 'f-weight-min', 'f-weight-max']) {
-    document.getElementById(id).value = '';
+  for (let type = 0; type < types.length; type++) {
+    const box = document.getElementById(`type-${type}`);
+    if (box) box.checked = true;
+  }
+  for (const id of ['f-in-min', 'f-in-max', 'f-out-min', 'f-out-max', 'f-value-min', 'f-value-max']) {
+    const element = document.getElementById(id);
+    if (element) element.value = '';
   }
   applyFilters();
 }
@@ -786,7 +861,7 @@ canvas.addEventListener('pointerup', (event) => {
   const index = pick(event.clientX, event.clientY);
   selected = index;
   if (index >= 0) showDetail(index);
-  else detailEl.textContent = '点击节点查看数值与连接';
+  else detailEl.textContent = '点击神经元查看入度/出度并进入 SMCGP 图';
   requestRender();
 });
 
@@ -817,11 +892,6 @@ document.getElementById('locate').addEventListener('click', locate);
 searchInput.addEventListener('keydown', (event) => {
   if (event.key === 'Enter') locate();
 });
-for (const id of ['f-in-min', 'f-in-max', 'f-out-min', 'f-out-max', 'f-value-min', 'f-value-max', 'f-weight-min', 'f-weight-max']) {
-  document.getElementById(id).addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') applyFilters();
-  });
-}
 
 fetch('/api/graph', { cache: 'no-store' })
   .then((response) => {
